@@ -1,0 +1,71 @@
+{
+  "dataset_id": "ds_e622b6550f344f459bb0b1086f579112",
+  "question": "اعرض متوسط «death_count» حسب السنوات الهجرية باستخدام «death_date».",
+  "language": "Arabic",
+  "brief_fingerprint": null,
+  "analysis": {
+    "sql": "SELECT \n    substr(translate(death_date, '٠١٢٣٤٥٦٧٨٩', '0123456789'), 1, 4) AS \"السنة الهجرية\", \n    avg(death_count) AS \"متوسط الوفيات\" \nFROM \"ds_e622b6550f344f459bb0b1086f579112\" \nGROUP BY 1 \nORDER BY 1",
+    "columns": [
+      {
+        "name": "السنة الهجرية",
+        "meaning": "السنة الهجرية",
+        "kind": "time",
+        "unit": null,
+        "source": null,
+        "aggregate": "none",
+        "denominator": null
+      },
+      {
+        "name": "متوسط الوفيات",
+        "meaning": "متوسط عدد الوفيات",
+        "kind": "measure",
+        "unit": null,
+        "source": "death_count",
+        "aggregate": "avg",
+        "denominator": "null"
+      }
+    ],
+    "summary": "بلغ متوسط عدد الوفيات في عام 1445 هـ حوالي 48.51 شخصاً، بينما ارتفع في عام 1446 هـ ليصل إلى حوالي 54.28 شخصاً.",
+    "assumptions": [
+      "تم استخراج السنة من تاريخ الوفاة الهجري عبر أخذ أول 4 رموز من النص بعد تحويل الأرقام العربية-الهندية إلى أرقام عربية."
+    ]
+  },
+  "clarification": null,
+  "result": {
+    "sql": "SELECT \n    substr(translate(death_date, '٠١٢٣٤٥٦٧٨٩', '0123456789'), 1, 4) AS \"السنة الهجرية\", \n    avg(death_count) AS \"متوسط الوفيات\" \nFROM \"ds_e622b6550f344f459bb0b1086f579112\" \nGROUP BY 1 \nORDER BY 1",
+    "columns": [
+      "السنة الهجرية",
+      "متوسط الوفيات"
+    ],
+    "types": [
+      "VARCHAR",
+      "DOUBLE"
+    ],
+    "rows": [
+      [
+        "1445",
+        48.505319148936174
+      ],
+      [
+        "1446",
+        54.28089887640449
+      ]
+    ],
+    "row_count": 2,
+    "checks": [],
+    "seconds": 0.0179488329886226
+  },
+  "checks": [
+    {
+      "column": null,
+      "check": "summary_numbers_exist",
+      "severity": "error",
+      "passed": true,
+      "message": "ok"
+    }
+  ],
+  "warnings": [],
+  "model": "google/gemma-4-31b-it",
+  "seconds": 3.4780635420029284,
+  "created_at": "2026-09-07T20:43:52.241792Z"
+}

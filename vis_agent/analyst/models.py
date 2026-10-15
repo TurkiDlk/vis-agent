@@ -1,0 +1,148 @@
+"""The analyst contracts: the query result, the analysis, the clarification, and the report."""
+
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from vis_agent.profiler.models import ProfileCheck
+
+ColumnKind = Literal["category", "ordinal", "time", "measure", "share", "geography", "identifier"]
+Aggregate = Literal["sum", "avg", "count", "count_distinct", "min", "max", "share", "none"]
+Cell = str | int | float | bool | None
+
+
+class ResultColumn(BaseModel):
+    """What one result column holds, written by the model when it runs the query."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(description="The column name exactly as it appears in the result.")
+    meaning: str = Field(description="What the column holds, in plain words, in the caller's language.")
+    kind: ColumnKind = Field(description="category: a label. ordinal: an ordered label. time: a date or period. "
+                                         "measure: a number. share: a percentage or fraction. geography: a place or "
+                                         "coordinate. identifier: a key.")
+    unit: str | None = Field(default=None, description="Unit of a measure or share, such as SAR or %. Null otherwise.")
+    source: str | None = Field(default=None, description="The dataset column this comes from, or null when computed "
+                                                         "from several.")
+    aggregate: Aggregate = Field(default="none", description="How the source was aggregated, or none.")
+    denominator: str | None = Field(default=None, description="For a share: what the share is of, in words.")
+    partition_by: list[str] | None = Field(default=None, description=(
+        "Omit or use null for every non-share column. For shares: null for a scalar, partial selection, or independent row rates. "
+        "[] declares a complete partition across the result; ['year'] declares a complete partition "
+        "within each value of those exact result grouping columns. New percentages use unit %."))
+
+    @field_validator("unit", "source", "denominator", "partition_by", mode="before")
+    @classmethod
+    def _placeholder_is_null(cls, value):
+        # Models sometimes write the word null, or a dash, instead of a JSON null. A unit like that would be
+        # printed on the picture, and a source like that fails the column check and can end a run.
+        if isinstance(value, str) and value.strip().lower() in {"", "null", "none", "n/a", "na", "-"}:
+            return None
+        return value
+
+    @model_validator(mode="after")
+    def _consistent(self):
+        if self.unit is not None and self.kind not in ("measure", "share"):
+            raise ValueError("unit belongs only on a measure or a share")
+        if self.kind == "share" and not self.denominator:
+            # A missing denominator is a gap in the description, not a wrong result; rejecting it cost whole runs.
+            self.denominator = "not stated"
+        # Models sometimes copy grouping names or placeholder lists onto every column.
+        # Partition metadata has no meaning on a non-share and cannot affect its SQL;
+        # discard that annotation instead of spending query retries on an unrelated field.
+        if self.kind != "share":
+            self.partition_by = None
+        if self.partition_by is not None:
+            if any(not name.strip() for name in self.partition_by) or len(set(self.partition_by)) != len(self.partition_by):
+                raise ValueError("partition_by must contain distinct, nonempty column names")
+            if self.name in self.partition_by:
+                raise ValueError("partition_by cannot contain the share itself")
+        return self
+
+
+class AnalysisRevision(BaseModel):
+    """The designer's request for a different result table: an internal handoff, never a question to the caller."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    problem: str
+    requested_change: str
+    preserve: str
+    evidence: list[str] = Field(default_factory=list)
+
+
+class RevisionRound(BaseModel):
+    """What the designer sees after the analyst revised the table: its own request and the analyst's reply."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request: AnalysisRevision
+    reply: str
+
+
+class PreviousAnalysis(BaseModel):
+    """The analysis being revised: what produced the earlier result, and what must differ.
+
+    feedback is set when the change came from the chart designer, not the caller.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sql: str
+    columns: list[ResultColumn]
+    change: str
+    feedback: AnalysisRevision | None = None
+
+
+class QueryResult(BaseModel):
+    """What run_query returns when the statement ran: the bounded table and the checks."""
+
+    sql: str
+    columns: list[str]
+    types: list[str]
+    rows: list[list[Cell]]
+    row_count: int
+    checks: list[ProfileCheck] = Field(default_factory=list)
+    seconds: float
+
+
+class QueryError(BaseModel):
+    """What run_query returns when the statement was rejected or failed. The model reads it and repairs."""
+
+    sql: str
+    error: str
+    hint: str | None = None
+
+
+class Analysis(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sql: str
+    columns: list[ResultColumn]
+    summary: str
+    assumptions: list[str] = Field(default_factory=list)
+
+
+class Clarification(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str
+    reason: str
+
+
+class AnalysisReport(BaseModel):
+    """What every caller receives."""
+
+    dataset_id: str
+    question: str
+    language: str
+    brief_fingerprint: str | None = None
+    analysis: Analysis | None = None
+    clarification: Clarification | None = None
+    result: QueryResult | None = None
+    checks: list[ProfileCheck] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    model: str | None = None
+    seconds: float
+    created_at: datetime

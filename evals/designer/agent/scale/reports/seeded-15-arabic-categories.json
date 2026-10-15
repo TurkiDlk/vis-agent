@@ -1,0 +1,91 @@
+{
+  "dataset_id": "ds_c4e8eda4293c4d70889bed1a5d2cc845",
+  "question": "اعرض قيم «count» حسب «age_group».",
+  "language": "Arabic",
+  "brief_fingerprint": null,
+  "analysis": {
+    "sql": "SELECT age_group, count FROM \"ds_c4e8eda4293c4d70889bed1a5d2cc845\"",
+    "columns": [
+      {
+        "name": "age_group",
+        "meaning": "الفئة العمرية",
+        "kind": "ordinal",
+        "unit": null,
+        "source": "age_group",
+        "aggregate": "none",
+        "denominator": "null"
+      },
+      {
+        "name": "count",
+        "meaning": "العدد",
+        "kind": "measure",
+        "unit": null,
+        "source": "count",
+        "aggregate": "none",
+        "denominator": "null"
+      }
+    ],
+    "summary": "توضح البيانات قيم «count» لكل فئة عمرية، حيث سجلت الفئة «غير محدد (Riyadh)» أعلى قيمة بـ 12,893، تليها الفئة «+65» بـ 12,548. بينما سجلت الفئة «55-64» أقل قيمة بـ 8,642.",
+    "assumptions": [
+      "تم عرض البيانات كما هي موجودة في الجدول دون أي تجميع إضافي."
+    ]
+  },
+  "clarification": null,
+  "result": {
+    "sql": "SELECT age_group, count FROM \"ds_c4e8eda4293c4d70889bed1a5d2cc845\"",
+    "columns": [
+      "age_group",
+      "count"
+    ],
+    "types": [
+      "VARCHAR",
+      "BIGINT"
+    ],
+    "rows": [
+      [
+        "15-24",
+        8748
+      ],
+      [
+        "25-34",
+        8754
+      ],
+      [
+        "35-44",
+        8644
+      ],
+      [
+        "45-54",
+        8705
+      ],
+      [
+        "55-64",
+        8642
+      ],
+      [
+        "65+",
+        12548
+      ],
+      [
+        "غير محدد (Riyadh)",
+        12893
+      ]
+    ],
+    "row_count": 7,
+    "checks": [],
+    "seconds": 0.008477832991047762
+  },
+  "checks": [
+    {
+      "column": null,
+      "check": "summary_numbers_exist",
+      "severity": "error",
+      "passed": true,
+      "message": "ok"
+    }
+  ],
+  "warnings": [],
+  "model": "google/gemma-4-31b-it",
+  "seconds": 2.9089109170017764,
+  "created_at": "2026-09-07T20:44:15.628185Z"
+}

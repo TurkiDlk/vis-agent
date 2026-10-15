@@ -1,0 +1,83 @@
+{
+  "dataset_id": "ds_ed39c931986f4e81a42bbc9aeb677cee",
+  "question": "اعرض قيم «avg_days_to_graduate» حسب «university_name».",
+  "language": "Arabic",
+  "brief_fingerprint": null,
+  "analysis": {
+    "sql": "SELECT university_name, CAST(replace(translate(avg_days_to_graduate, '٠١٢٣٤٥٦٧٨٩٫٬', '0123456789.,'), ',', '') AS DOUBLE) AS avg_days_to_graduate FROM \"ds_ed39c931986f4e81a42bbc9aeb677cee\"",
+    "columns": [
+      {
+        "name": "university_name",
+        "meaning": "اسم الجامعة",
+        "kind": "category",
+        "unit": null,
+        "source": "university_name",
+        "aggregate": "none",
+        "denominator": null
+      },
+      {
+        "name": "avg_days_to_graduate",
+        "meaning": "متوسط عدد الأيام حتى التخرج",
+        "kind": "measure",
+        "unit": "يوم",
+        "source": "avg_days_to_graduate",
+        "aggregate": "none",
+        "denominator": null
+      }
+    ],
+    "summary": "تظهر البيانات متوسط عدد الأيام حتى التخرج لكل جامعة، حيث سجلت جامعة الفيصل 1389 يوماً، بينما سجلت الجامعات الأخرى (أم القرى، الإمام محمد بن سعود الإسلامية، الملك عبدالعزيز، والملك سعود) 1387 يوماً.",
+    "assumptions": [
+      "تم تحويل الأرقام المكتوبة بالخط العربي-الهندي إلى أرقام عشرية."
+    ]
+  },
+  "clarification": null,
+  "result": {
+    "sql": "SELECT university_name, CAST(replace(translate(avg_days_to_graduate, '٠١٢٣٤٥٦٧٨٩٫٬', '0123456789.,'), ',', '') AS DOUBLE) AS avg_days_to_graduate FROM \"ds_ed39c931986f4e81a42bbc9aeb677cee\"",
+    "columns": [
+      "university_name",
+      "avg_days_to_graduate"
+    ],
+    "types": [
+      "VARCHAR",
+      "DOUBLE"
+    ],
+    "rows": [
+      [
+        "جامعة أم القرى",
+        1387.0
+      ],
+      [
+        "جامعة الإمام محمد بن سعود الإسلامية",
+        1387.0
+      ],
+      [
+        "جامعة الملك عبدالعزيز",
+        1387.0
+      ],
+      [
+        "جامعة الملك سعود",
+        1387.0
+      ],
+      [
+        "جامعة الفيصل",
+        1389.0
+      ]
+    ],
+    "row_count": 5,
+    "checks": [],
+    "seconds": 0.013652541994815692
+  },
+  "checks": [
+    {
+      "column": null,
+      "check": "summary_numbers_exist",
+      "severity": "error",
+      "passed": true,
+      "message": "ok"
+    }
+  ],
+  "warnings": [],
+  "model": "google/gemma-4-31b-it",
+  "seconds": 5.616795833004289,
+  "created_at": "2026-09-07T20:44:12.709904Z"
+}

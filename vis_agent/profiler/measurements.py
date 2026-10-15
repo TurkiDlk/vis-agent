@@ -1,0 +1,404 @@
+"""Every statistic and every measurement label comes from a DuckDB query. Python assigns labels."""
+
+import math
+import re
+
+from vis_agent.store import DatasetStore, quote_identifier
+from vis_agent.models import UploadedDataset
+from vis_agent.profiler.models import (
+    ColumnStatistics,
+    DeterministicProfile,
+    GeographicRole,
+    NumericStatistics,
+    ValueCount,
+)
+
+SAMPLE_ROWS = 5
+VALUE_CHARACTERS = 120
+MAX_MODEL_VALUE_BYTES = 256
+MAX_DETAILED_COLUMNS = 40  # columns past this get counts and types only, so the prompt stays bounded
+MAX_ORDINAL_DISTINCT = 50
+MAX_LEVEL_DISTINCT = 12
+COORDINATE_TEXT_SHARE = 0.9
+# Ordered scales written in words. A column whose distinct values all sit on one scale is ordinal.
+ORDERED_SCALES = (
+    ("very low", "low", "medium", "high", "very high"),
+    ("poor", "lower middle", "middle", "upper middle", "rich"),
+    ("tiny", "small", "medium", "large", "huge"),
+    ("weak", "moderate", "strong"),
+    ("bad", "poor", "fair", "good", "very good", "excellent"),
+    ("first", "second", "third", "fourth", "fifth"),
+    ("primary", "intermediate", "secondary", "tertiary"),
+    ("منخفض", "متوسط", "مرتفع"),
+    ("ضعيف", "متوسط", "جيد", "جيد جدا", "ممتاز"),
+    ("صغير", "متوسط", "كبير"),
+    ("فقير", "متوسط", "غني"),
+    ("primary", "elementary", "middle school", "high school", "secondary", "diploma", "associate", "bachelor",
+     "bachelors", "bachelor's", "master", "masters", "master's", "doctorate", "phd"),
+    ("ابتدائي", "متوسط", "ثانوي", "ثانوية", "دبلوم متوسط", "دبلوم", "بكالوريوس", "جامعي", "دبلوم عالي", "ماجستير", "دكتوراه"),
+)
+LOWER_BAND = re.compile(r"^(?:below|under|less than|up to|at most|<=?|أقل من|دون|حتى)\s*(\d+(?:\.\d+)?)$")
+UPPER_BAND = re.compile(
+    r"^(?:(?:above|over|more than|at least|>=?|أعلى من|أكثر من|فوق)\s*(\d+(?:\.\d+)?)|"
+    r"(\d+(?:\.\d+)?)\s*(?:\+|and (?:over|above|more)|or more|فأكثر|وأكثر))$"
+)
+RANGE_BAND = re.compile(r"^(?:من\s*)?(\d+(?:\.\d+)?)\s*(?:-|–|to|إلى|الى)\s*(\d+(?:\.\d+)?)$")
+MAX_CODE_DISTINCT = 12
+MAX_CODE_LENGTH = 3
+INTEGER_TYPES = ("TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT",
+                 "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT")
+NUMERIC_TYPES = INTEGER_TYPES + ("FLOAT", "DOUBLE", "DECIMAL")
+TIME_TYPES = ("DATE", "TIMESTAMP", "TIME")
+
+GEOMETRY_NAME = re.compile(r"(^|[_\s])(wkt|geom|geometry|the_geom|shape)($|[_\s])", re.IGNORECASE)
+LATITUDE_NAME = re.compile(r"(^|[_\s])(lat|latitude)($|[_\s])", re.IGNORECASE)
+LONGITUDE_NAME = re.compile(r"(^|[_\s])(lon|lng|long|longitude)($|[_\s])", re.IGNORECASE)
+PLACE_TOKENS = ("country", "region", "city", "cities", "state", "province", "district", "governorate", "county",
+                "municipality", "location", "port", "airport", "station", "town", "village", "neighborhood", "zone",
+                "address", "منطقة", "مدينة", "محافظة", "بلدية", "حي", "مطار", "منفذ", "ميناء", "قرية", "دولة", "موقع")
+ORDER_TOKENS = ("sequence", "seq", "rank", "ranking", "order", "level", "grade", "rating", "priority", "stage",
+                "tier", "position", "step", "round", "تسلسل", "ترتيب", "مستوى", "درجة", "رتبة", "مرحلة", "أولوية")
+ORDER_NAME = re.compile(r"(^|[_\s])(ال)?(" + "|".join(ORDER_TOKENS) + r")($|[_\s])", re.IGNORECASE)
+MEASURE_TOKENS = ("count", "total", "sum", "avg", "mean", "percentage", "percent", "rate", "ratio", "size", "number",
+                  "num", "value", "amount", "share", "category", "mode", "type")
+PLACE_NAME = re.compile(r"(^|[_\s])(ال)?(" + "|".join(PLACE_TOKENS) + r")($|[_\s])", re.IGNORECASE)
+MEASURE_NAME = re.compile(r"(^|[_\s])(" + "|".join(MEASURE_TOKENS) + r")($|[_\s])", re.IGNORECASE)
+# RE2 syntax, evaluated inside DuckDB. Values never leave the database for these checks.
+WKT_SQL_PATTERN = r"^\s*(SRID=\d+;)?(POINT|LINESTRING|POLYGON|MULTIPOINT|MULTILINESTRING|MULTIPOLYGON|GEOMETRYCOLLECTION)\b"
+ORDINAL_SQL_PATTERN = r"^\D*\d+\D*$"
+DIGITS_SQL_PATTERN = r"\d+"
+LOCALIZED_TEXT_SHARE = 0.9
+HIJRI_SQL_PATTERN = (
+    r"^1[34]\d{2}([-/](0?[1-9]|1[0-2])([-/](0?[1-9]|[12]\d|30))?)?$"
+    r"|^(0?[1-9]|[12]\d|30) "
+    r"(محرم|صفر|ربيع الأول|ربيع الآخر|ربيع الثاني|جمادى الأولى|جمادى الآخرة|جمادى الثانية|"
+    r"رجب|شعبان|رمضان|شوال|ذو القعدة|ذي القعدة|ذو الحجة|ذي الحجة) 1[34]\d{2}$"
+)
+# One zero-padded numeric form sorts as text in date order; bounds are reported only then.
+HIJRI_PADDED_SQL_PATTERNS = {
+    separator: rf"^1[34][0-9]{{2}}({separator}(0[1-9]|1[0-2])({separator}(0[1-9]|[12][0-9]|30))?)?$"
+    for separator in ("-", "/")
+}
+BOOLEAN_PAIRS = [
+    {"true", "false"}, {"yes", "no"}, {"y", "n"}, {"t", "f"}, {"on", "off"}, {"نعم", "لا"},
+]
+
+
+def preview(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if len(text) <= VALUE_CHARACTERS else text[:VALUE_CHARACTERS] + "…"
+
+
+def finite_number(value: object) -> float | None:
+    if value is None:
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def compute_statistics(
+    store: DatasetStore, source: UploadedDataset, *, table_name: str | None = None,
+) -> DeterministicProfile:
+    table = quote_identifier(table_name or store.table_name(source.dataset_id))
+    columns = []
+    warnings = []
+    with store.connect() as connection:
+        schema = connection.execute(f"DESCRIBE {table}").fetchall()
+        row_count = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        unique_rows = connection.execute(f"SELECT count(*) FROM (SELECT DISTINCT * FROM {table})").fetchone()[0]
+        for index, (name, physical_type, *_rest) in enumerate(schema):
+            column = quote_identifier(name)
+            null_count, distinct_count, maximum_value_bytes = connection.execute(
+                f"SELECT count(*) - count({column}), count(DISTINCT {column}), "
+                f"coalesce(max(octet_length(encode(CAST({column} AS VARCHAR)))), 0) FROM {table}"
+            ).fetchone()
+            is_text = physical_type == "VARCHAR"
+            wkt_count = 0
+            if is_text:
+                wkt_count = connection.execute(
+                    f"SELECT count(*) FILTER (WHERE regexp_matches({column}, ?, 'i')) FROM {table}",
+                    [WKT_SQL_PATTERN],
+                ).fetchone()[0]
+            geometry_name = bool(GEOMETRY_NAME.search(name))
+            stats = ColumnStatistics(
+                name=name,
+                original_name=source.headers[index],
+                physical_type=physical_type,
+                null_count=null_count,
+                null_percentage=100 * null_count / row_count if row_count else 0,
+                distinct_count=distinct_count,
+                maximum_value_bytes=maximum_value_bytes,
+                values_omitted=maximum_value_bytes > MAX_MODEL_VALUE_BYTES or geometry_name or wkt_count > 0
+                or index >= MAX_DETAILED_COLUMNS,
+            )
+            if row_count and null_count == row_count:
+                warnings.append(f"{name}: all values are null.")
+            elif distinct_count == 1:
+                warnings.append(f"{name}: only one distinct non-null value.")
+
+            # Decide from the entire column, before retrieving any values for a model.
+            if stats.values_omitted:
+                if physical_type.startswith(TIME_TYPES):
+                    stats.measurement_levels = ["time"]
+                elif physical_type.startswith(NUMERIC_TYPES):
+                    stats.measurement_levels = ["interval"]
+                else:
+                    stats.measurement_levels = ["nominal"]
+                    if geometry_name or wkt_count > 0:
+                        stats.geographic_role = "wkt"
+                        stats.measurement_levels.append("geographic")
+                columns.append(stats)
+                continue
+
+            if physical_type.startswith(NUMERIC_TYPES):
+                _numeric_labels(connection, table, column, name, stats, row_count, null_count, warnings)
+            elif physical_type.startswith(TIME_TYPES):
+                stats.measurement_levels = ["time"]
+            elif physical_type == "BOOLEAN":
+                # DuckDB normalizes yes/no to BOOLEAN at import.
+                stats.measurement_levels = ["nominal"]
+                stats.boolean_vocabulary = ["false", "true"]
+            else:
+                stats.measurement_levels = ["nominal"]
+                if geometry_name or wkt_count > 0:
+                    stats.geographic_role = "wkt"
+                elif LATITUDE_NAME.search(name) or LONGITUDE_NAME.search(name):
+                    stats.geographic_role = _coordinate_text_role(
+                        connection, table, column, name, row_count - null_count, warnings,
+                    )
+                elif PLACE_NAME.search(name) and not MEASURE_NAME.search(name):
+                    stats.geographic_role = "place_name"
+                if stats.geographic_role is not None:
+                    stats.measurement_levels.append("geographic")
+
+            if physical_type.startswith(TIME_TYPES):
+                earliest, latest = connection.execute(
+                    f"SELECT min({column}), max({column}) FROM {table}"
+                ).fetchone()
+                stats.earliest, stats.latest = preview(earliest), preview(latest)
+            elif not physical_type.startswith(NUMERIC_TYPES):
+                common = connection.execute(
+                    f"SELECT {column}, count(*) AS frequency FROM {table} "
+                    f"WHERE {column} IS NOT NULL GROUP BY {column} "
+                    f"ORDER BY frequency DESC, {column} ASC LIMIT 5"
+                ).fetchall()
+                stats.common_values = [ValueCount(value=preview(value), count=count) for value, count in common]
+            if is_text or physical_type == "DATE":
+                _localized_labels(connection, table, column, stats, row_count, warnings)
+            if is_text and not {"hijri", "arabic_digits"}.intersection(stats.measurement_levels):
+                _text_labels(connection, table, column, stats, distinct_count, row_count - null_count)
+            columns.append(stats)
+
+        _hijri_year_labels(connection, table, columns)
+
+        # Oversized columns stay in DuckDB; neither agent receives their values.
+        sample_names = [c.name for c in columns if not c.values_omitted]
+        sample = []
+        if sample_names:
+            selection = ", ".join(map(quote_identifier, sample_names))
+            rows = connection.execute(f"SELECT {selection} FROM {table} LIMIT {SAMPLE_ROWS}").fetchall()
+            sample = [dict(zip(sample_names, map(preview, row))) for row in rows]
+    if len(columns) > MAX_DETAILED_COLUMNS:
+        warnings.append(
+            f"Only the first {MAX_DETAILED_COLUMNS} columns include statistics, samples, and common values; "
+            f"{len(columns) - MAX_DETAILED_COLUMNS} more columns include metadata and counts only."
+        )
+    if row_count == 0:
+        warnings.append("The CSV has a header but no data rows.")
+    return DeterministicProfile(
+        row_count=row_count,
+        column_count=len(columns),
+        duplicate_rows=row_count - unique_rows,
+        columns=columns,
+        sample_rows=sample,
+        sample_description=(
+            f"Statistics cover every imported row. Sample: first {SAMPLE_ROWS} rows in import order; "
+            f"sample and common-value text is capped at {VALUE_CHARACTERS} characters. "
+            f"Columns containing any value over {MAX_MODEL_VALUE_BYTES} UTF-8 bytes, any WKT value, "
+            "or named like geometry are excluded entirely from samples and common values; only metadata "
+            f"and counts are included, as are all columns after the first {MAX_DETAILED_COLUMNS}. "
+            "Measurement levels are assigned from whole-column queries. "
+            "Numeric aggregates use finite double-precision values and population standard deviation. "
+            "CSV settings: UTF-8, comma delimiter, header row, full-file type inference, empty fields as null."
+        ),
+        warnings=warnings,
+    )
+
+
+def _localized_labels(connection, table, column, stats, row_count, warnings) -> None:
+    non_null = row_count - stats.null_count
+    if not non_null:
+        return
+    translated = f"translate(CAST({column} AS VARCHAR), '٠١٢٣٤٥٦٧٨٩', '0123456789')"
+    padded = list(HIJRI_PADDED_SQL_PATTERNS.values())
+    hijri_count, hyphen_count, slash_count, earliest, latest = connection.execute(
+        f"SELECT count(*) FILTER (WHERE hijri), count(*) FILTER (WHERE regexp_matches(v, ?)), "
+        f"count(*) FILTER (WHERE regexp_matches(v, ?)), min(v) FILTER (WHERE hijri), max(v) FILTER (WHERE hijri) "
+        f"FROM (SELECT v, regexp_matches(v, ?) AS hijri FROM (SELECT {translated} AS v FROM {table}))",
+        [*padded, HIJRI_SQL_PATTERN],
+    ).fetchone()
+    if stats.physical_type == "VARCHAR":
+        number = f"TRY_CAST(replace(translate({translated}, '٫٬', '.,'), ',', '') AS DOUBLE)"
+        numeric_count, arabic_count = connection.execute(
+            f"SELECT count({number}), count(*) FILTER (WHERE regexp_matches(CAST({column} AS VARCHAR), '[٠-٩]')) "
+            f"FROM {table}"
+        ).fetchone()
+        # Plain ASCII numeric text keeps its old labels; the level names digits actually written in Arabic-Indic.
+        if arabic_count and numeric_count >= LOCALIZED_TEXT_SHARE * non_null:
+            _numeric_labels(connection, table, number, stats.name, stats, row_count, stats.null_count, warnings)
+            stats.measurement_levels.append("arabic_digits")
+    if hijri_count >= LOCALIZED_TEXT_SHARE * non_null:
+        stats.measurement_levels.append("hijri")
+        # Month names and unpadded or mixed separators do not sort as text; leave those bounds unset.
+        if hijri_count in (hyphen_count, slash_count):
+            stats.earliest, stats.latest = preview(earliest), preview(latest)
+
+
+def _hijri_year_labels(connection, table, columns) -> None:
+    # Use a second pass so a Gregorian companion can occur on either side of the year column.
+    gregorian_companion = False
+    for stats in columns:
+        if "time" in stats.measurement_levels and stats.physical_type.startswith(("DATE", "TIMESTAMP")):
+            column = quote_identifier(stats.name)
+            count, modern_count = connection.execute(
+                f"SELECT count({column}), count(*) FILTER (WHERE year({column}) > 1900) FROM {table}"
+            ).fetchone()
+            if count and count == modern_count:
+                gregorian_companion = True
+                break
+    for stats in columns:
+        if stats.values_omitted or not stats.physical_type.startswith(INTEGER_TYPES):
+            continue
+        name = stats.name.lower()
+        named_hijri = "hijri" in name or "هجري" in name or name.endswith("_h")
+        named_year = "year" in name or "سنة" in name or "عام" in name
+        # A Gregorian date beside the column is evidence only for a column that is called a year.
+        if not (named_hijri or (gregorian_companion and named_year)):
+            continue
+        column = quote_identifier(stats.name)
+        count, in_range, earliest, latest = connection.execute(
+            f"SELECT count({column}), count(*) FILTER (WHERE {column} BETWEEN 1300 AND 1500), "
+            f"min(CAST({column} AS VARCHAR)), max(CAST({column} AS VARCHAR)) FROM {table}"
+        ).fetchone()
+        if count and count == in_range:
+            stats.measurement_levels.append("hijri")
+            stats.earliest, stats.latest = preview(earliest), preview(latest)
+
+
+def _coordinate_text_role(connection, table, column, name, non_null, warnings) -> GeographicRole | None:
+    role = "latitude" if LATITUDE_NAME.search(name) else "longitude"
+    low, high = (-90, 90) if role == "latitude" else (-180, 180)
+    numeric_count, in_range = connection.execute(
+        f"SELECT count(*) FILTER (WHERE TRY_CAST({column} AS DOUBLE) IS NOT NULL), "
+        f"count(*) FILTER (WHERE TRY_CAST({column} AS DOUBLE) BETWEEN {low} AND {high}) "
+        f"FROM {table} WHERE {column} IS NOT NULL"
+    ).fetchone()
+    if numeric_count > 0 and numeric_count >= COORDINATE_TEXT_SHARE * non_null and in_range == numeric_count:
+        if non_null - numeric_count > 0:
+            warnings.append(f"{name}: coordinates stored as text; {non_null - numeric_count} values are not numbers.")
+        return role
+    return None
+
+
+def _numeric_labels(connection, table, column, name, stats, row_count, null_count, warnings) -> None:
+    finite_count, *metrics = connection.execute(
+        f"SELECT count(*), min(v), max(v), avg(v), stddev_pop(v), "
+        "quantile_cont(v, 0.25), quantile_cont(v, 0.5), quantile_cont(v, 0.75) "
+        f"FROM (SELECT CAST({column} AS DOUBLE) AS v FROM {table}) WHERE isfinite(v)"
+    ).fetchone()
+    stats.numeric = NumericStatistics(
+        finite_count=finite_count,
+        non_finite_count=row_count - null_count - finite_count,
+        **dict(zip(
+            ["minimum", "maximum", "mean", "standard_deviation", "q25", "median", "q75"],
+            map(finite_number, metrics),
+        )),
+    )
+    if stats.numeric.non_finite_count:
+        excluded = "non-finite or unparseable values" if stats.physical_type == "VARCHAR" else "non-finite values"
+        warnings.append(f"{name}: numeric statistics exclude {excluded}.")
+    if stats.physical_type.startswith(INTEGER_TYPES):
+        stats.integer_valued = True
+    elif finite_count:
+        stats.integer_valued = bool(connection.execute(
+            f"SELECT bool_and(v = floor(v)) FROM (SELECT CAST({column} AS DOUBLE) AS v FROM {table}) WHERE isfinite(v)"
+        ).fetchone()[0])
+    stats.measurement_levels = ["interval", "discrete" if stats.integer_valued else "continuous"]
+    low, high = stats.numeric.minimum, stats.numeric.maximum
+    if low is not None and high is not None:
+        if LATITUDE_NAME.search(name) and -90 <= low and high <= 90:
+            stats.geographic_role = "latitude"
+        elif LONGITUDE_NAME.search(name) and -180 <= low and high <= 180:
+            stats.geographic_role = "longitude"
+    if stats.geographic_role is not None:
+        stats.measurement_levels.append("geographic")
+    if (stats.integer_valued and ORDER_NAME.search(name)
+            and low in (0, 1) and high - low + 1 == stats.distinct_count
+            and 2 <= stats.distinct_count <= MAX_LEVEL_DISTINCT
+            and stats.distinct_count * 2 <= finite_count):
+        stats.ordinal_pattern = " < ".join(str(v) for v in range(int(low), int(high) + 1))
+        stats.measurement_levels.append("ordinal")
+
+
+def _ordered_scale(values) -> list[str] | None:
+    present = {value for value in values if value}
+    for scale in ORDERED_SCALES:
+        if len(present) >= 1 and present <= set(scale):
+            return [value for value in scale if value in present]
+    return None
+
+
+def _ordered_bands(values) -> list[str] | None:
+    """Bands such as "under 18", "18-35", "over 60", or "أقل من 4" / "أعلى من 4" form an ordered scale."""
+    if len(values) < 2:
+        return None
+    bands = []
+    for value in values:
+        if match := LOWER_BAND.fullmatch(value):
+            key = (float(match[1]), 0)
+        elif match := RANGE_BAND.fullmatch(value):
+            key = (float(match[1]), 1)
+        elif match := UPPER_BAND.fullmatch(value):
+            key = (float(match[1] or match[2]), 2)
+        else:
+            return None
+        bands.append((key, value))
+    return [value for key, value in sorted(bands)]
+
+
+def _text_labels(connection, table, column, stats, distinct_count, non_null) -> None:
+    if distinct_count == 2:
+        (values,) = connection.execute(
+            f"SELECT list(DISTINCT lower(trim({column}))) FROM {table} WHERE {column} IS NOT NULL"
+        ).fetchone()
+        if set(values) in BOOLEAN_PAIRS:
+            stats.boolean_vocabulary = sorted(values)
+    if 2 <= distinct_count <= MAX_ORDINAL_DISTINCT and distinct_count < non_null:
+        non_matching, templates = connection.execute(
+            f"SELECT count(*) FILTER (WHERE NOT regexp_matches({column}, ?)), "
+            f"count(DISTINCT regexp_replace({column}, ?, '#', 'g')) FROM {table} WHERE {column} IS NOT NULL",
+            [ORDINAL_SQL_PATTERN, DIGITS_SQL_PATTERN],
+        ).fetchone()
+        if non_matching == 0 and templates == 1:
+            stats.ordinal_pattern = connection.execute(
+                f"SELECT regexp_replace(min({column}), ?, '#', 'g') FROM {table}", [DIGITS_SQL_PATTERN]
+            ).fetchone()[0]
+            stats.measurement_levels.append("ordinal")
+    if stats.ordinal_pattern is None and 1 <= distinct_count <= MAX_LEVEL_DISTINCT:
+        (values,) = connection.execute(
+            f"SELECT list(DISTINCT lower(trim({column}))) FROM {table} WHERE {column} IS NOT NULL"
+        ).fetchone()
+        scale = _ordered_scale(values) or _ordered_bands(values)
+        if scale:
+            stats.ordinal_pattern = " < ".join(scale)
+            stats.measurement_levels.append("ordinal")
+    if 1 <= distinct_count <= MAX_CODE_DISTINCT and distinct_count < non_null:
+        (longest,) = connection.execute(f"SELECT max(length({column})) FROM {table}").fetchone()
+        if longest is not None and longest <= MAX_CODE_LENGTH:
+            stats.codes = [
+                str(value) for (value,) in connection.execute(
+                    f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL ORDER BY 1"
+                ).fetchall()
+            ]

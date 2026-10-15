@@ -1,0 +1,228 @@
+{
+  "sales": {
+    "roles": {
+      "order_id": "identifier",
+      "region": "geography",
+      "order_date": "time",
+      "amount": "measure"
+    },
+    "levels": {
+      "order_id": [
+        "interval",
+        "discrete"
+      ],
+      "region": [
+        "nominal"
+      ],
+      "order_date": [
+        "time"
+      ],
+      "amount": [
+        "interval",
+        "continuous"
+      ]
+    },
+    "failed_checks": [],
+    "units": {
+      "amount": "USD"
+    }
+  },
+  "quarterly": {
+    "roles": {
+      "quarter": "ordinal",
+      "revenue": "measure"
+    },
+    "levels": {
+      "quarter": [
+        "nominal",
+        "ordinal"
+      ],
+      "revenue": [
+        "interval",
+        "discrete"
+      ]
+    },
+    "failed_checks": [],
+    "units": {}
+  },
+  "survey": {
+    "roles": {
+      "respondent_id": "identifier",
+      "satisfied": "boolean",
+      "age": "measure"
+    },
+    "levels": {
+      "satisfied": [
+        "nominal"
+      ],
+      "age": [
+        "interval",
+        "discrete"
+      ]
+    },
+    "failed_checks": [],
+    "units": {}
+  },
+  "citizens": {
+    "roles": {
+      "citizen_id": "identifier",
+      "gender": "category",
+      "wealthy": "boolean",
+      "income": "measure"
+    },
+    "levels": {
+      "gender": [
+        "nominal"
+      ],
+      "wealthy": [
+        "nominal"
+      ],
+      "income": [
+        "interval",
+        "discrete"
+      ]
+    },
+    "failed_checks": [],
+    "units": {}
+  },
+  "stores": {
+    "roles": {
+      "store": "category",
+      "latitude": "geography",
+      "longitude": "geography",
+      "monthly_sales": "measure"
+    },
+    "levels": {
+      "latitude": [
+        "geographic"
+      ],
+      "longitude": [
+        "geographic"
+      ]
+    },
+    "failed_checks": [],
+    "units": {}
+  },
+  "districts_wkt": {
+    "roles": {
+      "district": "geography",
+      "boundary": "geography"
+    },
+    "levels": {
+      "district": [
+        "nominal",
+        "geographic"
+      ],
+      "boundary": [
+        "nominal",
+        "geographic"
+      ]
+    },
+    "failed_checks": [],
+    "units": {}
+  },
+  "conflict_units": {
+    "roles": {
+      "product": "category",
+      "price": "text"
+    },
+    "levels": {
+      "price": [
+        "nominal"
+      ]
+    },
+    "failed_checks": [
+      "brief_unit_fits_numeric_column"
+    ],
+    "units": {}
+  },
+  "conflict_codes": {
+    "roles": {
+      "ticket": "identifier",
+      "status": "category"
+    },
+    "levels": {
+      "status": [
+        "nominal"
+      ]
+    },
+    "failed_checks": [
+      "brief_codes_present_in_data"
+    ],
+    "units": {}
+  },
+  "monthly": {
+    "roles": {
+      "month": "time",
+      "active_users": "measure"
+    },
+    "levels": {
+      "month": [
+        "time"
+      ],
+      "active_users": [
+        "interval",
+        "discrete"
+      ]
+    },
+    "failed_checks": [],
+    "units": {}
+  },
+  "wide": {
+    "roles": {
+      "product": "category",
+      "jan": "measure",
+      "feb": "measure",
+      "mar": "measure"
+    },
+    "levels": {
+      "jan": [
+        "interval",
+        "discrete"
+      ]
+    },
+    "failed_checks": [],
+    "units": {}
+  },
+  "arabic": {
+    "roles": {
+      "المدينة": "geography",
+      "المبيعات": "measure",
+      "التاريخ": "time"
+    },
+    "levels": {
+      "المدينة": [
+        "nominal"
+      ],
+      "المبيعات": [
+        "interval",
+        "discrete"
+      ],
+      "التاريخ": [
+        "time"
+      ]
+    },
+    "failed_checks": [],
+    "units": {}
+  },
+  "ids": {
+    "roles": {
+      "order_id": "identifier",
+      "customer_code": "category",
+      "sku": "identifier"
+    },
+    "levels": {
+      "order_id": [
+        "nominal"
+      ],
+      "customer_code": [
+        "nominal"
+      ],
+      "sku": [
+        "nominal"
+      ]
+    },
+    "failed_checks": [],
+    "units": {}
+  }
+}

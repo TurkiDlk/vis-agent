@@ -1,0 +1,1099 @@
+"""Resolve result cells into renderer options without calling a model."""
+
+from copy import deepcopy
+
+import pytest
+
+from vis_agent.designer.catalogue import CATALOGUE
+from vis_agent.designer.models import IndicatorCard, NumberFormat, Spec
+from vis_agent.designer.resolve import ResolveError, resolve
+from vis_agent.designer.syntax import parse
+from vis_agent.labels import value_key
+
+from .conftest import (cities, column, gender_share, grouped, monthly, raw_amounts,
+                       scatter_points, single_number, table, two_same_unit_measures,
+                       two_same_unit_measures_by_city, two_units)
+
+
+def city_spec(chart="column", **kwargs):
+    return Spec(type=chart, bind={"category": "city", "value": "violations"}, **kwargs)
+
+
+@pytest.mark.parametrize("pattern", [None, "0.00%", "0.00 percentage", "0.00 percent"])
+def test_percent_alias_formats_on_ordinary_charts_preserve_the_scale(pattern):
+    columns = [column("city", "category"), column("violations", "measure", unit="percentage")]
+    result = table(columns, [["Riyadh", 108.86], ["Jeddah", .34]])
+    before = result.model_copy(deep=True)
+    resolved = resolve(city_spec(format=pattern), columns, result)
+    assert resolved.number.unit == "%"
+    assert result == before
+
+
+def test_indicator_binds_by_column_identity_without_aggregating_or_dropping_null():
+    columns = [column("count", "measure", unit="count"), column("percent", "share", unit="%"),
+               column("region", "category"), column("period", "time")]
+    result = table(columns, [[0, None, "الرياض", "١٤٤٧-٠٩"]])
+    before = result.model_copy(deep=True)
+    spec = Spec(type="indicator", language="ar", digits="arabic",
+                cards=[IndicatorCard(value="percent", support=["count"], context=["region", "period"])])
+    resolved = resolve(spec, columns[::-1], result)
+    card = resolved.config["cards"][0]
+    assert card["value"] == {"column": "percent", "label": "percent", "unit": "%",
+                             "state": "unavailable", "display": "غير متاح", "exact": None,
+                             "number": "غير متاح", "unitLabel": "%", "exactNumber": None}
+    assert card["support"][0]["display"] == "٠"
+    assert [c["text"] for c in card["context"]] == ["الرياض", "١٤٤٧-٠٩"]
+    assert (resolved.drawn_rows, resolved.dropped_rows, resolved.folded_rows) == (1, 0, 0)
+    assert result == before
+    assert resolved.config["direction"] == "rtl"
+    assert "data" not in resolved.config and resolved.overrides == {}
+
+
+@pytest.mark.parametrize("value,unit,pattern,display,exact", [
+    (9007199254740993, None, None, "9,007,199,254,740,993", None),
+    (0, "%", None, "0%", None),
+    (0.34, None, None, "0.34", None),
+    (0.34, "%", None, "0.34%", None),
+    (108.86, "percentage", None, "108.86%", None),
+    (108.86, "percentage", "0.00%", "108.86%", None),
+    (0.34, "percentage", None, "0.34%", None),
+    (-108.86, "percent", None, "-108.86%", None),
+    (108.86, "نسبة مئوية", None, "108.86%", None),
+    (9.913666751770636, "%", None, "9.91%", "9.913666751770636%"),
+    (0.0005393990555122537, "%", None, "0.0005394%", "0.0005393990555122537%"),
+    (-0.0005393990555122537, "%", "0.00%", "0.00%", "-0.0005393990555122537%"),
+    (1e-100, None, None, "1e-100", None),
+    (-150, "%", None, "-150%", None),
+    (250, "%", None, "250%", None),
+    (1234567, "SAR", "0k", "1.2M SAR", "1234567 SAR"),
+])
+def test_indicator_number_text_preserves_saved_values(value, unit, pattern, display, exact):
+    columns = [column("value", "measure", unit=unit)]
+    spec = Spec(type="indicator", cards=[IndicatorCard(value="value", format=pattern)])
+    card = resolve(spec, columns, table(columns, [[value]])).config["cards"][0]
+    assert card["value"]["display"] == display
+    assert card["value"]["exact"] == exact
+    assert card["value"]["unit"] == unit  # Historical source metadata is retained.
+
+
+def test_indicator_card_order_and_each_unit_are_explicit():
+    columns = [column("duration", "measure", unit="hours"), column("revenue", "measure", unit="SAR")]
+    spec = Spec(type="indicator", digits="arabic", cards=[IndicatorCard(value="revenue"), IndicatorCard(value="duration")])
+    cards = resolve(spec, columns, table(columns, [[2.5, 1240]])).config["cards"]
+    assert [c["value"]["column"] for c in cards] == ["revenue", "duration"]
+    assert [c["value"]["display"] for c in cards] == ["١٬٢٤٠ SAR", "٢٫٥ hours"]
+
+
+def test_indicator_translated_labels_preserve_bound_report_values_and_metadata():
+    columns = [column("value", "measure", unit="%"), column("support", "measure"), column("period", "time")]
+    result = table(columns, [[12.5, 25, "1447-09"]])
+    original_columns = [column.model_copy(deep=True) for column in columns]
+    original_result = result.model_copy(deep=True)
+    spec = Spec(type="indicator", language="ar", column_labels={"value": "النسبة", "support": "العدد", "period": "الفترة"},
+                cards=[IndicatorCard(value="value", support=["support"], context=["period"])])
+    card = resolve(spec, columns, result).config["cards"][0]
+    assert [card["value"]["label"], card["support"][0]["label"], card["context"][0]["label"]] == ["النسبة", "العدد", "الفترة"]
+    assert card["value"]["display"] == "12.5%" and card["context"][0]["text"] == "1447-09"
+    assert columns == original_columns and result == original_result
+
+
+@pytest.mark.parametrize("unit", ["person", "persons", "people", " Person ", "شخص", "أشخاص", "فرد", "أفراد", "نسمة"])
+def test_indicator_count_nouns_remain_visible_while_axis_count_policy_stays_unchanged(unit):
+    columns = [column("value", "measure", unit=unit)]
+    result = table(columns, [[18]])
+    spec = Spec(type="indicator", cards=[IndicatorCard(value="value")])
+    value = resolve(spec, columns, result).config["cards"][0]["value"]
+    assert value["display"] == "18 people" and value["unit"] == unit
+    assert value["number"] == "18" and value["unitLabel"] == "people"
+    assert resolve(Spec(type="table"), columns, result).table_formats["value"]["unit"] == unit
+    chart_columns, chart_result = cities()
+    chart_columns[1].unit = unit
+    assert resolve(city_spec(), chart_columns, chart_result).number.unit == unit
+    assert columns[0].unit == unit
+
+
+@pytest.mark.parametrize("unit,amount,language,suffix", [
+    ("person", 1, "en", "person"), ("person", 18, "en", "people"),
+    ("person", 18, "ar", "شخصًا"), ("people", 3, "ar", "أشخاص"),
+    ("users", 18, "ar", "مستخدمًا"), ("orders", 5, "ar", "طلبات"),
+    ("users", None, "ar", "مستخدمين"), ("SAR", None, "ar", "SAR"),
+])
+def test_indicator_localizes_meaningful_count_units_and_keeps_unavailable_unit(unit, amount, language, suffix):
+    columns = [column("value", "measure", unit=unit)]
+    spec = Spec(type="indicator", language=language, cards=[IndicatorCard(value="value")])
+    value = resolve(spec, columns, table(columns, [[amount]])).config["cards"][0]["value"]
+    assert value["unitLabel"] == suffix and value["unit"] == unit
+    assert value["number"] == ("غير متاح" if amount is None else str(amount))
+
+
+@pytest.mark.parametrize("unit", ["person-days", "SAR/person", "people/km²", "person hours", "ساعة/شخص"])
+def test_count_noun_normalization_preserves_compound_units(unit):
+    columns = [column("value", "measure", unit=unit)]
+    result = table(columns, [[18]])
+    spec = Spec(type="indicator", cards=[IndicatorCard(value="value")])
+    value = resolve(spec, columns, result).config["cards"][0]["value"]
+    assert value["display"] == f"18 {unit}" and value["unit"] == unit
+    assert resolve(Spec(type="table"), columns, result).table_formats["value"]["unit"] == unit
+
+
+@pytest.mark.parametrize("value", [True, "123", "NaN", float("inf"), float("nan")])
+def test_indicator_resolve_rejects_invalid_numeric_cells(value):
+    columns = [column("value", "measure")]
+    spec = Spec(type="indicator", cards=[IndicatorCard(value="value")])
+    with pytest.raises(ResolveError, match="finite numer"):
+        resolve(spec, columns, table(columns, [[value]]))
+
+
+@pytest.mark.parametrize("rows,total", [([], 0), ([[1], [2]], 2), ([[1]], 200)])
+def test_indicator_resolve_never_picks_the_first_row(rows, total):
+    columns = [column("value", "measure")]
+    result = table(columns, rows)
+    result.row_count = total
+    with pytest.raises(ResolveError, match="exactly one complete"):
+        resolve(Spec(type="indicator", cards=[IndicatorCard(value="value")]), columns, result)
+
+
+@pytest.mark.parametrize("value,unit", [(120, "%"), (-1, "%"), (1.2, "fraction")])
+def test_direct_indicator_resolution_preserves_supplied_values_without_revalidating_the_data(value, unit):
+    columns = [column("value", "share", unit=unit)]
+    resolved = resolve(Spec(type="indicator", cards=[IndicatorCard(value="value")]), columns, table(columns, [[value]]))
+    assert resolved.config["cards"][0]["value"]["number"] == str(value)
+
+
+def test_indicator_resolve_rejects_changed_unit_even_without_a_prior_check():
+    columns = [column("value", "measure", unit="SAR")]
+    spec = Spec(type="indicator", cards=[IndicatorCard(value="value", format="0.0%")])
+    with pytest.raises(ResolveError, match="preserve the unit"):
+        resolve(spec, columns, table(columns, [[100]]))
+
+
+def group_spec(chart="grouped_column", **kwargs):
+    return Spec(type=chart, bind={"category": "city", "group": "gender", "value": "n"}, **kwargs)
+
+
+def line_spec(chart="line", **kwargs):
+    return Spec(type=chart, bind={"time": "month", "value": "visits"}, **kwargs)
+
+
+def test_bind_column_by_name_not_description_order():
+    columns, result = cities()
+    resolved = resolve(city_spec(), columns[::-1], result)
+    assert resolved.config["data"] == [
+        {"category": f"City{i}", "value": (5 - i) * 10} for i in range(5)
+    ]
+    assert resolved.config["type"] == "column"
+    assert (resolved.width, resolved.height) == (800, 450)
+    assert (resolved.config["width"], resolved.config["height"]) == (800, 450)
+    assert (resolved.drawn_rows, resolved.folded_rows, resolved.dropped_rows) == (5, 0, 0)
+
+
+@pytest.mark.parametrize("chart,field", [("treemap", "name"), ("radar", "name"), ("word_cloud", "text")])
+def test_catalogue_field_renaming_after_sort_and_fold(chart, field):
+    resolved = resolve(city_spec(chart, limit=2), *cities())
+    assert resolved.config["type"] == CATALOGUE.get(chart).draw.type
+    assert resolved.config["data"] == [
+        {field: "City0", "value": 50}, {field: "City1", "value": 40}, {field: "Other", "value": 60},
+    ]
+
+
+@pytest.mark.parametrize("chart,flag", [("grouped_column", "group"), ("grouped_bar", "group"),
+                                       ("stacked_column", "stack"), ("stacked_bar", "stack")])
+def test_grouped_and_stacked_catalogue_options(chart, flag):
+    resolved = resolve(group_spec(chart), *grouped())
+    assert resolved.config[flag] is True
+    assert resolved.config["data"][0] == {"category": "City4", "group": "F", "value": 14}
+
+
+def test_multi_line_fold_resolves_two_series_in_month_order():
+    columns, result = two_same_unit_measures()
+    spec = Spec(type="multi_line", bind={"time": "month"}, fold=["injuries", "deaths"])
+    resolved = resolve(spec, columns, result)
+    assert resolved.config["type"] == "line"
+    assert resolved.config["data"] == [
+        {"time": month, "group": group, "value": value}
+        for month, injuries, deaths in result.rows
+        for group, value in [("injuries", injuries), ("deaths", deaths)]
+    ]
+    assert {row["group"] for row in resolved.config["data"]} == {"injuries", "deaths"}
+    assert resolved.drawn_rows == 24
+
+
+def test_grouped_column_fold_sorts_categories_by_combined_total():
+    columns, result = two_same_unit_measures_by_city()
+    result.rows.reverse()
+    spec = Spec(type="grouped_column", bind={"category": "city"}, fold=["revenue", "cost"])
+    resolved = resolve(spec, columns, result)
+    assert [(row["category"], row["group"], row["value"]) for row in resolved.config["data"]] == [
+        ("Riyadh", "revenue", 120), ("Riyadh", "cost", 80),
+        ("Jeddah", "revenue", 100), ("Jeddah", "cost", 75),
+        ("Dammam", "revenue", 90), ("Dammam", "cost", 55),
+        ("Mecca", "revenue", 70), ("Mecca", "cost", 50),
+        ("Medina", "revenue", 60), ("Medina", "cost", 45),
+    ]
+    assert spec.fold == ["revenue", "cost"]
+
+
+def test_folded_measure_labels_apply_when_series_is_also_the_category():
+    columns = [column("female_pct", "share", unit="%"), column("male_pct", "share", unit="%")]
+    result = table(columns, [[19.94, 20.02]])
+    spec = Spec(type="grouped_column", language="ar", bind={"category": "السلسلة"},
+                fold=["female_pct", "male_pct"],
+                column_labels={"female_pct": "نسبة النساء", "male_pct": "نسبة الذكور"})
+    resolved = resolve(spec, columns, result)
+    labels = {"female_pct": "نسبة النساء", "male_pct": "نسبة الذكور"}
+    assert resolved.display["fields"]["category"] == labels
+    assert resolved.display["fields"]["group"] == labels
+    assert sorted(record["value"] for record in resolved.config["data"]) == [19.94, 20.02]
+    assert result.rows == [[19.94, 20.02]]
+
+
+@pytest.mark.parametrize("bin_number,labels,count", [
+    (None, ["1–6.9", "6.9–12.8", "12.8–18.7", "18.7–24.6", "24.6–30.5",
+            "30.5–36.4", "36.4–42.3", "42.3–48.2", "48.2–54.1", "54.1–60"], 6),
+    (4, ["1–15.75", "15.75–30.5", "30.5–45.25", "45.25–60"], 15),
+])
+@pytest.mark.parametrize("direction", ["ltr", "rtl"])
+def test_histogram_resolves_ascending_equal_width_bins(bin_number, labels, count, direction):
+    spec = Spec(type="histogram", bind={"value": "amount"}, bin_number=bin_number,
+                direction=direction, sort="value desc", labels="on")
+    columns, result = raw_amounts()
+    result.rows = result.rows[::2][::-1] + result.rows[1::2]
+    resolved = resolve(spec, columns, result)
+    assert resolved.config["type"] == "column"
+    assert resolved.config["data"] == [{"category": label, "value": count} for label in labels]
+    assert "binNumber" not in resolved.config
+    assert "x" not in resolved.overrides.get("scale", {})
+    assert resolved.overrides["labels"] == [{"text": "value"}]
+    assert (resolved.drawn_rows, resolved.folded_rows, resolved.dropped_rows) == (60, 0, 0)
+
+
+@pytest.mark.parametrize("digits", ["western", "arabic"])
+def test_histogram_keeps_empty_bins_and_counts_boundaries_once(digits):
+    columns, _ = raw_amounts()
+    result = table(columns, [[v] for v in [1100, 300, 1000, 100] * 15] + [[None]])
+    spec = Spec(type="histogram", bind={"value": "amount"}, digits=digits, format="0k SAR")
+    resolved = resolve(spec, columns, result)
+    labels = ["100–200", "200–300", "300–400", "400–500", "500–600",
+              "600–700", "700–800", "800–900", "900–1,000", "1,000–1,100"]
+    if digits == "arabic":
+        labels = [label.translate(str.maketrans("0123456789,", "٠١٢٣٤٥٦٧٨٩٬")) for label in labels]
+    assert resolved.config["data"] == [
+        {"category": label, "value": count}
+        for label, count in zip(labels, [15, 0, 15, 0, 0, 0, 0, 0, 0, 30])
+    ]
+    assert (resolved.drawn_rows, resolved.dropped_rows) == (60, 1)
+    assert resolved.number.unit is None
+
+
+def test_histogram_bin_labels_match_shared_default_rounding():
+    columns, _ = raw_amounts()
+    result = table(columns, [[-1], [0]] * 30)
+    spec = Spec(type="histogram", bind={"value": "amount"}, bin_number=8)
+    resolved = resolve(spec, columns, result)
+    assert [row["category"] for row in resolved.config["data"]] == [
+        "-1–-0.88", "-0.88–-0.75", "-0.75–-0.63", "-0.63–-0.5",
+        "-0.5–-0.38", "-0.38–-0.25", "-0.25–-0.13", "-0.13–0",
+    ]
+    assert [row["value"] for row in resolved.config["data"]] == [30, 0, 0, 0, 0, 0, 0, 30]
+
+
+@pytest.mark.parametrize("digits", ["western", "arabic"])
+def test_histogram_small_range_keeps_ten_distinct_labels(digits):
+    columns, _ = raw_amounts()
+    result = table(columns, [[i / 100000] for i in range(30)])
+    spec = Spec(type="histogram", bind={"value": "amount"}, digits=digits)
+    resolved = resolve(spec, columns, result)
+    labels = [row["category"] for row in resolved.config["data"]]
+    assert len(labels) == len(set(labels)) == 10
+    expected = ["0–0.000029", "0.000261–0.00029"]
+    if digits == "arabic":
+        expected = [label.translate(str.maketrans("0123456789.", "٠١٢٣٤٥٦٧٨٩٫")) for label in expected]
+    assert [labels[0], labels[-1]] == expected
+    assert [row["value"] for row in resolved.config["data"]] == [3] * 10
+    assert resolved.drawn_rows == 30
+
+
+def test_histogram_half_unit_width_trims_trailing_zeros():
+    columns, _ = raw_amounts()
+    result = table(columns, [[1], [2]])
+    spec = Spec(type="histogram", bind={"value": "amount"}, bin_number=2)
+    assert resolve(spec, columns, result).config["data"] == [
+        {"category": "1–1.5", "value": 1}, {"category": "1.5–2", "value": 1},
+    ]
+
+
+def test_histogram_rejects_boundaries_that_precision_cannot_distinguish():
+    columns, _ = raw_amounts()
+    result = table(columns, [[1], [1.0000000000000002]])
+    spec = Spec(type="histogram", bind={"value": "amount"})
+    with pytest.raises(ResolveError, match="reduce binNumber"):
+        resolve(spec, columns, result)
+
+
+def test_histogram_constant_values_have_one_degenerate_bin():
+    columns, _ = raw_amounts()
+    result = table(columns, [[-2.5]] * 30)
+    resolved = resolve(Spec(type="histogram", bind={"value": "amount"}), columns, result)
+    assert resolved.config["data"] == [{"category": "-2.5–-2.5", "value": 30}]
+
+
+@pytest.mark.parametrize("rows", [[], [[None]] * 30])
+def test_histogram_without_values_has_no_bins(rows):
+    columns, _ = raw_amounts()
+    resolved = resolve(Spec(type="histogram", bind={"value": "amount"}), columns, table(columns, rows))
+    assert resolved.config["data"] == []
+    assert (resolved.drawn_rows, resolved.dropped_rows) == (0, len(rows))
+
+
+@pytest.mark.parametrize("bin_number", [0, -1])
+def test_histogram_rejects_nonpositive_bin_number(bin_number):
+    spec = Spec(type="histogram", bind={"value": "amount"}, bin_number=bin_number)
+    with pytest.raises(ResolveError, match="binNumber must be positive"):
+        resolve(spec, *raw_amounts())
+
+
+def test_dual_axes_series_and_categories_remain_aligned_after_null_drop():
+    columns, result = two_units()
+    result.rows[1][2] = None
+    spec = Spec(type="dual_axes", bind={"category": "month", "value": "visits", "value2": "revenue"})
+    resolved = resolve(spec, columns, result)
+    rows = [row for row in result.rows if row[2] is not None]
+    assert resolved.config["type"] == "dual-axes"
+    assert resolved.config["categories"] == [row[0] for row in rows]
+    assert resolved.config["series"] == [
+        {"type": "column", "data": [row[1] for row in rows], "axisYTitle": "visits"},
+        {"type": "line", "data": [row[2] for row in rows], "axisYTitle": "revenue"},
+    ]
+    assert (resolved.drawn_rows, resolved.dropped_rows) == (11, 1)
+
+
+@pytest.mark.parametrize("builder", [single_number, gender_share])
+def test_table_preserves_all_columns_cells_and_order(builder):
+    columns, result = builder()
+    result.rows[0][-1] = None
+    resolved = resolve(Spec(type="table", sort="value desc", limit=1, percent=True), columns, result)
+    assert resolved.config == {"type": "spreadsheet", "columns": result.columns,
+                               "data": [dict(zip(result.columns, row)) for row in result.rows],
+                               "width": 800, "height": 450}
+    assert (resolved.drawn_rows, resolved.folded_rows, resolved.dropped_rows) == (len(result.rows), 0, 0)
+
+
+@pytest.mark.parametrize("rows,expected_height", [(2, 450), (14, 458), (17, 548), (78, 2378)])
+def test_static_table_default_height_fits_every_row(rows, expected_height):
+    columns, result = cities(rows)
+    before = result.model_copy(deep=True)
+    resolved = resolve(Spec(type="table"), columns, result)
+    assert resolved.height == resolved.config["height"] == expected_height
+    assert resolved.drawn_rows == len(resolved.config["data"]) == rows
+    assert resolved.dropped_rows == 0 and result == before
+
+
+@pytest.mark.parametrize("height", [450, 547, 2401])
+def test_static_table_rejects_explicit_clipping_or_oversized_height(height):
+    with pytest.raises(ResolveError, match="Omit height.*548–2400.*cannot scroll"):
+        resolve(Spec(type="table", height=height), *cities(17))
+
+
+def test_static_table_preserves_large_enough_explicit_height():
+    resolved = resolve(Spec(type="table", height=700), *cities(17))
+    assert resolved.height == resolved.config["height"] == 700
+
+
+@pytest.mark.parametrize("rows", [79, 1000])
+def test_static_table_reports_full_table_resource_limit_without_sampling(rows):
+    columns, result = cities(rows)
+    before = result.model_copy(deep=True)
+    with pytest.raises(ResolveError, match=f"complete {rows}-row table.*2400px.*No rows were sampled"):
+        resolve(Spec(type="table"), columns, result)
+    assert result == before
+
+
+@pytest.mark.parametrize("cell", ["12", "text", True, False])
+def test_measure_rejects_text_and_bool_without_coercion(cell):
+    columns, result = cities()
+    result.rows[1][1] = cell
+    with pytest.raises(ResolveError, match="column 'violations'.*row 1.*numeric"):
+        resolve(city_spec(), columns, result)
+
+
+@pytest.mark.parametrize("role,index", [("x", 0), ("y", 1)])
+def test_scatter_validates_and_drops_either_measure(role, index):
+    columns, result = scatter_points(3)
+    spec = Spec(type="scatter", bind={"x": "age", "y": "amount"})
+    result.rows[0][index] = "bad"
+    with pytest.raises(ResolveError, match=spec.bind[role]):
+        resolve(spec, columns, result)
+    result.rows[0][index] = None
+    resolved = resolve(spec, columns, result)
+    assert resolved.config["data"] == [{"x": 2, "y": 20}, {"x": 3, "y": 30}]
+    assert resolved.dropped_rows == 1
+
+
+@pytest.mark.parametrize("language,unknown", [("en", "Unknown"), ("ar", "غير معروف")])
+def test_null_values_drop_rows_and_null_labels_use_language(language, unknown):
+    columns, result = cities(3)
+    result.rows[0][1] = None
+    result.rows[1][0] = None
+    resolved = resolve(city_spec(language=language), columns, result)
+    assert resolved.config["data"] == [{"category": unknown, "value": 20}, {"category": "City2", "value": 10}]
+    assert (resolved.drawn_rows, resolved.dropped_rows) == (2, 1)
+    assert any("1" in c.message and "drop" in c.message.lower() for c in resolved.compromises)
+
+
+def test_custom_unknown_applies_to_group_and_category():
+    columns, result = grouped(1)
+    result.rows[0][:2] = [None, None]
+    resolved = resolve(group_spec(unknown="Missing"), columns, result)
+    assert resolved.config["data"][0] == {"category": "Missing", "group": "Missing", "value": 10}
+
+
+@pytest.mark.parametrize("sort,expected", [(None, ["A", "C", "B"]), ("value asc", ["B", "C", "A"]),
+                                          ("category asc", ["A", "B", "C"]),
+                                          ("category desc", ["C", "B", "A"]), ("none", ["B", "A", "C"])])
+def test_sort_orders(sort, expected):
+    columns, _ = cities()
+    result = table(columns, [["B", 10], ["A", 30], ["C", 20]])
+    assert [r["category"] for r in resolve(city_spec(sort=sort), columns, result).config["data"]] == expected
+
+
+def test_category_sort_uses_text_for_numeric_labels():
+    columns, _ = cities()
+    result = table(columns, [[2, 20], [10, 10]])
+    assert [r["category"] for r in resolve(city_spec(sort="category asc"), columns, result).config["data"]] == [10, 2]
+
+
+@pytest.mark.parametrize("kind", ["time", "ordinal"])
+def test_ordered_category_axis_preserves_input_order(kind):
+    columns, result = cities()
+    columns[0] = column("city", kind)
+    result.rows.reverse()
+    resolved = resolve(city_spec(), columns, result)
+    assert [r["category"] for r in resolved.config["data"]] == [r[0] for r in result.rows]
+
+
+def test_group_sort_uses_category_total_and_preserves_group_order():
+    columns, _ = grouped()
+    result = table(columns, [["A", "F", 1], ["B", "F", 40], ["A", "M", 60], ["B", "M", 10]])
+    resolved = resolve(group_spec(), columns, result)
+    assert [(r["category"], r["group"]) for r in resolved.config["data"]] == [
+        ("A", "F"), ("A", "M"), ("B", "F"), ("B", "M"),
+    ]
+
+
+@pytest.mark.parametrize("language,other", [("en", "Other"), ("ar", "أخرى")])
+def test_limit_folds_after_sort(language, other):
+    resolved = resolve(city_spec(limit=5, language=language), *cities(8))
+    assert len(resolved.config["data"]) == 6
+    assert resolved.config["data"][-1] == {"category": other, "value": 60}
+    assert (resolved.drawn_rows, resolved.folded_rows, resolved.dropped_rows) == (6, 3, 0)
+
+
+def test_group_limit_counts_categories_and_sums_other_per_group():
+    resolved = resolve(group_spec(limit=5, other="Rest"), *grouped(8))
+    assert resolved.config["data"][-2:] == [
+        {"category": "Rest", "group": "F", "value": 33},
+        {"category": "Rest", "group": "M", "value": 33},
+    ]
+    assert (resolved.drawn_rows, resolved.folded_rows) == (12, 6)
+
+
+def test_limit_with_no_tail_adds_no_other():
+    resolved = resolve(city_spec(limit=5), *cities(5))
+    assert resolved.drawn_rows == 5 and resolved.folded_rows == 0
+
+
+def test_non_additive_limit_is_rejected():
+    columns, result = cities()
+    columns[1] = column("violations", "measure", aggregate="avg")
+    with pytest.raises(ResolveError, match="additive"):
+        resolve(city_spec(limit=2), columns, result)
+
+
+@pytest.mark.parametrize("chart", ["stacked_column", "stacked_bar", "stacked_area"])
+def test_percent_stacks_sum_to_100_and_default_to_percent_unit(chart):
+    columns, result = grouped()
+    spec = group_spec(chart, percent=True)
+    axis = "category"
+    if chart == "stacked_area":
+        columns[0] = column("city", "time")
+        spec.bind["time"] = spec.bind.pop("category")
+        axis = "time"
+    resolved = resolve(spec, columns, result)
+    data = resolved.config["data"]
+    for label in {r[axis] for r in data}:
+        assert sum(r["value"] for r in data if r[axis] == label) == pytest.approx(100, abs=1e-9)
+    assert resolved.config["axisYTitle"] == "%"
+    assert resolved.number.unit == "%"
+    assert not any(c.key == "format" for c in resolved.compromises)
+
+
+def test_percent_runs_after_folding_and_honours_explicit_title_and_format():
+    columns, _ = grouped()
+    result = table(columns, [["A", "F", 50], ["A", "M", 50], ["B", "F", 9],
+                             ["B", "M", 1], ["C", "F", 0], ["C", "M", 20]])
+    resolved = resolve(group_spec("stacked_column", limit=1, percent=True,
+                                  axis_y_title="Share", format="0.0 pct"), columns, result)
+    assert resolved.config["data"][-2:] == [
+        {"category": "Other", "group": "F", "value": 30},
+        {"category": "Other", "group": "M", "value": 70},
+    ]
+    assert resolved.config["axisYTitle"] == "Share"
+    assert resolved.number.unit == "%"
+    assert resolved.number.decimals == 1
+
+
+def test_zero_percent_total_is_disclosed_without_dividing_by_zero():
+    columns, result = grouped(1)
+    for row in result.rows:
+        row[2] = 0
+    resolved = resolve(group_spec("stacked_column", percent=True), columns, result)
+    assert all(r["value"] == 0 for r in resolved.config["data"])
+    assert any(c.key == "percent" and "zero" in c.message for c in resolved.compromises)
+
+
+@pytest.mark.parametrize("theme,muted", [("default", "#C9CDD4"), ("dark", "#4E5969")])
+def test_emphasis_colors_follow_sorted_categories(theme, muted):
+    columns, _ = cities()
+    result = table(columns, [["Jeddah", 20], ["Riyadh", 1240], ["Dammam", 10]])
+    resolved = resolve(city_spec(emphasis=["Jeddah"], theme=theme), columns, result)
+    assert resolved.config["style"]["palette"] == [muted, "#1783FF", muted]
+
+
+def test_group_emphasis_colors_groups():
+    resolved = resolve(group_spec(emphasis=["M"]), *grouped())
+    assert resolved.config["style"]["palette"] == ["#C9CDD4", "#1783FF"]
+
+
+def test_explicit_palette_wins_and_style_background_passes_through():
+    spec = parse("vis column\nbind\n  category city\n  value violations\nemphasis\n  - City0\n"
+                 "style\n  backgroundColor #000000\n  palette\n    - #FFFFFF\n    - #1783FF\n")
+    resolved = resolve(spec, *cities(2))
+    assert resolved.config["style"] == {"backgroundColor": "#000000", "palette": spec.palette}
+
+
+@pytest.mark.parametrize("chart", ["column", "grouped_column", "stacked_column"])
+def test_arabic_columns_reverse_final_category_domain_and_align_title(chart):
+    spec, data = (group_spec(chart, language="ar", limit=2), grouped(3)) if "_" in chart else (
+        city_spec(chart, language="ar", limit=2), cities(3))
+    resolved = resolve(spec, *data)
+    categories = list(dict.fromkeys(r["category"] for r in resolved.config["data"]))
+    assert resolved.overrides["scale"]["x"]["domain"] == categories[::-1]
+    assert resolved.overrides["title"]["align"] == "right"
+    assert not any(c.key == "direction" for c in resolved.compromises)
+
+
+@pytest.mark.parametrize("chart", ["bar", "grouped_bar", "stacked_bar"])
+def test_arabic_bars_keep_value_desc_order_and_align_title(chart):
+    if chart == "bar":
+        spec = city_spec(chart, language="ar", sort="value desc")
+        columns, result = cities(3)
+        result.rows.reverse()
+        expected = [{"category": f"City{i}", "value": (3 - i) * 10} for i in range(3)]
+    else:
+        spec = group_spec(chart, language="ar", sort="value desc")
+        columns, result = grouped(3)
+        expected = [{"category": f"City{i}", "group": group, "value": 10 + i}
+                    for i in [2, 1, 0] for group in ["F", "M"]]
+    resolved = resolve(spec, columns, result)
+    assert "domain" not in resolved.overrides.get("scale", {}).get("x", {})
+    assert resolved.config["data"] == expected
+    assert resolved.overrides["title"]["align"] == "right"
+    assert not any(c.key == "direction" for c in resolved.compromises)
+
+
+def test_arabic_explicit_ltr_overrides_language_default():
+    resolved = resolve(city_spec(language="ar", direction="ltr"), *cities())
+    assert "domain" not in resolved.overrides.get("scale", {}).get("x", {})
+    assert resolved.overrides.get("title", {}).get("align") != "right"
+
+
+@pytest.mark.parametrize("chart", ["line", "column"])
+def test_time_axes_never_reverse_even_on_column(chart):
+    spec = line_spec(language="ar") if chart == "line" else Spec(
+        type="column", bind={"category": "month", "value": "visits"}, language="ar")
+    resolved = resolve(spec, *monthly())
+    assert "domain" not in resolved.overrides.get("scale", {}).get("x", {})
+    assert resolved.overrides["title"]["align"] == "right"
+
+
+def test_number_defaults_come_from_value_unit_and_language_does_not_change_digits():
+    columns, result = cities()
+    columns[1].unit = "ريال"
+    assert resolve(city_spec(language="ar"), columns, result).number == NumberFormat(unit="ريال")
+
+
+@pytest.mark.parametrize("pattern", [None, "0,0 SAR"])
+def test_histogram_count_format_has_no_unit(pattern):
+    spec = Spec(type="histogram", bind={"value": "amount"}, format=pattern)
+    resolved = resolve(spec, *raw_amounts())
+    assert resolved.number == NumberFormat(thousands=True, unit=None)
+    assert resolved.number2 is None
+
+
+@pytest.mark.parametrize("pattern,digits", [(None, "western"), ("0,0.0", "arabic")])
+def test_dual_axes_have_separate_units_and_measure_names(pattern, digits):
+    spec = Spec(type="dual_axes", bind={"category": "month", "value": "visits", "value2": "revenue"},
+                format=pattern, digits=digits)
+    resolved = resolve(spec, *two_units())
+    decimals = 1 if pattern else None
+    assert resolved.number == NumberFormat(unit="visits", decimals=decimals, digits=digits)
+    assert resolved.number2 == NumberFormat(unit="SAR", decimals=decimals, digits=digits)
+    assert [series["axisYTitle"] for series in resolved.config["series"]] == ["visits", "revenue"]
+    assert resolved.config["axisXTitle"] == "month"
+    assert resolved.config["axisYTitle"] == "visits"
+
+
+def test_dual_axes_second_unit_does_not_inherit_first_format_unit():
+    columns, result = two_units()
+    columns[2].unit = None
+    spec = Spec(type="dual_axes", bind={"category": "month", "value": "visits", "value2": "revenue"},
+                format="0,0.0 people")
+    resolved = resolve(spec, columns, result)
+    assert resolved.number.unit == "people"
+    assert resolved.number2 == NumberFormat(decimals=1, unit=None)
+
+
+@pytest.mark.parametrize("spec,builder", [(city_spec(), cities), (Spec(type="table"), single_number)])
+def test_other_entries_have_no_second_number_description(spec, builder):
+    assert resolve(spec, *builder()).number2 is None
+
+
+@pytest.mark.parametrize("spec,builder,x_title,y_title", [
+    (city_spec(), cities, "city", "violations"),
+    (line_spec(), monthly, "month", "visits"),
+    (Spec(type="scatter", bind={"x": "age", "y": "amount"}), scatter_points, "age", "amount"),
+])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_axis_titles_use_bound_names_unless_explicit(spec, builder, x_title, y_title, explicit):
+    if explicit:
+        spec = spec.model_copy(update={"axis_x_title": "Horizontal", "axis_y_title": "Vertical"})
+    config = resolve(spec, *builder()).config
+    assert config["axisXTitle"] == ("Horizontal" if explicit else x_title)
+    assert config["axisYTitle"] == ("Vertical" if explicit else y_title)
+
+
+@pytest.mark.parametrize("chart", ["pie", "donut", "treemap", "radar", "word_cloud", "table"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_entries_without_axes_have_no_axis_titles(chart, explicit):
+    spec = city_spec(chart, **({"axis_x_title": "Unused", "axis_y_title": "Unused"} if explicit else {}))
+    config = resolve(spec, *cities()).config
+    assert "axisXTitle" not in config and "axisYTitle" not in config
+
+
+def test_scatter_number_unit_comes_from_y():
+    columns, result = scatter_points()
+    columns[0].unit, columns[1].unit = "years", "SAR"
+    assert resolve(Spec(type="scatter", bind={"x": "age", "y": "amount"}), columns, result).number.unit == "SAR"
+
+
+def test_number_format_percent_and_digits_travel_with_compromise():
+    resolved = resolve(city_spec(format="0.0%", digits="arabic"), *cities())
+    assert resolved.number == NumberFormat(thousands=False, decimals=1, unit="%", digits="arabic")
+    assert any(c.key == "format" for c in resolved.compromises)
+    assert resolved.config["data"][0]["value"] == 50
+
+
+def test_percent_format_preserves_an_already_percentage_measure_scale():
+    columns, result = cities(2)
+    columns[1].unit = "%"
+    result.rows = [["Poor", 1.66], ["Rich", 1.68]]
+    resolved = resolve(city_spec(format="0.00%"), columns, result)
+    assert {row["category"]: row["value"] for row in resolved.config["data"]} == {
+        "Poor": 1.66, "Rich": 1.68,
+    }
+    assert resolved.number.decimals == 2 and resolved.number.unit == "%"
+    assert not any(compromise.key == "format" for compromise in resolved.compromises)
+
+
+def test_share_percent_format_has_no_non_share_compromise():
+    spec = Spec(type="donut", bind={"category": "label", "value": "share"}, format="0.0%")
+    resolved = resolve(spec, *gender_share())
+    assert not any(c.key == "format" for c in resolved.compromises)
+    assert resolved.config["innerRadius"] == 0.6
+
+
+def test_format_without_unit_inherits_column_unit():
+    columns, result = cities()
+    columns[1].unit = "SAR"
+    assert resolve(city_spec(format="0k"), columns, result).number == NumberFormat(
+        thousands=False, compact=True, unit="SAR")
+
+
+def test_inherited_percent_unit_does_not_claim_the_format_added_a_percent_sign():
+    columns, result = cities()
+    columns[1].unit = "%"
+    resolved = resolve(city_spec(format="0.0"), columns, result)
+    assert resolved.number.unit == "%"
+    assert not any(c.key == "format" for c in resolved.compromises)
+
+
+def test_axis_ranges_scale_switches_and_subtitle_merge():
+    spec = line_spec(axis_y_min=80, axis_y_max=300, subtitle="Monthly", labels="off", legend="off")
+    resolved = resolve(spec, *monthly())
+    assert resolved.overrides == {"scale": {"y": {"domainMin": 80, "domainMax": 300, "nice": False}},
+                                  "title": {"subtitle": "Monthly"}, "labels": [], "legend": False}
+    assert resolve(line_spec(axis_y_scale="log"), *monthly()).overrides["scale"]["y"] == {"type": "log"}
+
+
+def test_scatter_ranges_keep_both_axes():
+    spec = Spec(type="scatter", bind={"x": "age", "y": "amount"}, axis_x_min=0, axis_x_max=50,
+                axis_y_min=0, axis_y_max=500)
+    scale = resolve(spec, *scatter_points()).overrides["scale"]
+    assert scale["x"] == {"domainMin": 0, "domainMax": 50}
+    assert scale["y"] == {"domainMin": 0, "domainMax": 500, "nice": False}
+
+
+@pytest.mark.parametrize("zero,expected", [(None, True), (True, True), (False, False)])
+def test_line_zero_default_and_override(zero, expected):
+    assert resolve(line_spec(zero=zero), *monthly()).config["style"]["startAtZero"] is expected
+
+
+@pytest.mark.parametrize("chart", ["line", "multi_line", "area", "stacked_area"])
+@pytest.mark.parametrize("points,width", [(12, 800), (13, 1200), (24, 1200)])
+def test_width_uses_distinct_plotted_time_points(chart, points, width):
+    columns, result = monthly(points)
+    spec = line_spec(chart)
+    if chart in {"multi_line", "stacked_area"}:
+        columns.append(column("group", "category"))
+        result = table(columns, [row + [g] for row in result.rows for g in ["F", "M"]])
+        spec.bind["group"] = "group"
+    resolved = resolve(spec, columns, result)
+    assert resolved.width == width
+    assert resolved.config["style"]["startAtZero"] is True
+
+
+def test_explicit_size_and_base_options():
+    spec = city_spec("donut", width=900, height=500, inner_radius=0.4, title="Cities", theme="academy",
+                     axis_x_title="City", axis_y_title="Count")
+    config = resolve(spec, *cities()).config
+    assert {key: config[key] for key in ("width", "height", "innerRadius", "title", "theme")} == {
+        "width": 900, "height": 500, "innerRadius": 0.4, "title": "Cities", "theme": "academy",
+    }
+    assert "axisXTitle" not in config and "axisYTitle" not in config
+    assert resolve(line_spec(width=900), *monthly(24)).width == 900
+
+
+def test_resolution_does_not_mutate_inputs_or_catalogue():
+    columns, result = grouped(8)
+    spec = group_spec("stacked_column", limit=5, percent=True, palette=["#FFFFFF", "#1783FF"])
+    before = deepcopy((spec, columns, result, CATALOGUE))
+    resolved = resolve(spec, columns, result)
+    resolved.config["style"]["palette"].append("#000000")
+    resolved.config["data"][0]["value"] = -1
+    assert (spec, columns, result, CATALOGUE) == before
+
+
+@pytest.mark.parametrize("language,count", [("en", "Count"), ("ar", "العدد")])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_histogram_axis_titles(language, count, explicit):
+    spec = Spec(type="histogram", bind={"value": "amount"}, language=language,
+                axis_x_title="Amount" if explicit else None,
+                axis_y_title="Frequency" if explicit else None)
+    config = resolve(spec, *raw_amounts()).config
+    assert config["axisXTitle"] == ("Amount" if explicit else "amount")
+    assert config["axisYTitle"] == ("Frequency" if explicit else count)
+
+
+@pytest.mark.parametrize("chart", ["line", "area"])
+def test_switch_on_compromises_for_child_marks_and_single_series(chart):
+    resolved = resolve(line_spec(chart, labels="on", legend="on"), *monthly())
+    assert {c.key for c in resolved.compromises} == {"labels", "legend"}
+    assert any(c.message == "no legend: the chart has one series" for c in resolved.compromises)
+    assert "labels" not in resolved.overrides and "legend" not in resolved.overrides
+
+
+def test_group_palette_passes_through_in_group_order():
+    palette = ["#000000", "#123456"]
+    resolved = resolve(group_spec(palette=palette), *grouped())
+    assert resolved.config["style"]["palette"] == palette
+    assert list(dict.fromkeys(row["group"] for row in resolved.config["data"])) == ["F", "M"]
+
+
+@pytest.mark.parametrize("values,expected", [
+    ([2021, 2022], ["2021", "2022"]),
+    ([2021.0, 2022.5], ["2021", "2022.5"]),
+    (["2024-01-01T00:00:00", "2024-02-01T00:00:00"], ["2024-01", "2024-02"]),
+    (["2020-01-01T00:00:00+03:00", "2021-01-01T00:00:00+03:00"], ["2020", "2021"]),
+    (["2024-01-01", "2024-01-02T00:00:00Z"], ["2024-01-01", "2024-01-02"]),
+    (["2024-01-01T00:00:00", "2024-01-02 12:30:45+03:00"],
+     ["2024-01-01 00:00", "2024-01-02 12:30"]),
+    (["2024-01-01T12:00:10", "2024-01-01T12:00:20", "2024-01-01T12:00:30"],
+     ["2024-01-01 12:00:10", "2024-01-01 12:00:20", "2024-01-01 12:00:30"]),
+    (["2024-01-01T12:00:10.000001", "2024-01-01T12:00:10.000002"],
+     ["2024-01-01 12:00:10.000001", "2024-01-01 12:00:10.000002"]),
+    (["2024-01-01T12:00:10", "2024-01-01T12:00:10", "2024-01-01T12:01:20"],
+     ["2024-01-01 12:00", "2024-01-01 12:00", "2024-01-01 12:01"]),
+    (["2024-01-01T12:00:00+03:00", "2024-01-01T12:00:00+04:00"],
+     ["2024-01-01T12:00:00+03:00", "2024-01-01T12:00:00+04:00"]),
+    (["2024-01-01T00:00:00", "2024-02-30T00:00:00"],
+     ["2024-01-01T00:00:00", "2024-02-30T00:00:00"]),
+    (["2024-01-01T00:00:00", "Not a date"], ["2024-01-01T00:00:00", "Not a date"]),
+])
+@pytest.mark.parametrize("chart", ["column", "line", "dual_axes"])
+def test_time_labels_are_text_with_consistent_precision(values, expected, chart):
+    columns = [column("period", "time"), column("value", "measure"), column("value2", "measure")]
+    result = table(columns, [[value, i + 1, 10 * (i + 1)] for i, value in enumerate(values)])
+    role = "time" if chart == "line" else "category"
+    spec = Spec(type=chart, bind={role: "period", "value": "value"}, language="ar")
+    if chart == "dual_axes":
+        spec.bind["value2"] = "value2"
+    resolved = resolve(spec, columns, result)
+    labels = resolved.config["categories"] if chart == "dual_axes" else [r[role] for r in resolved.config["data"]]
+    assert labels == values
+    mapping = resolved.display["fields"].get(role, {})
+    assert [mapping.get(value_key(value), value_key(value)) for value in labels] == expected
+    assert len(set(labels)) == len(set(values))
+    assert "domain" not in resolved.overrides.get("scale", {}).get("x", {})
+    assert [row[0] for row in result.rows] == values
+
+
+@pytest.mark.parametrize("values", [
+    ["1447-02", "1447-03", "1447-04"],
+    ["صفر 1447", "ربيع الأول 1447", "ربيع الآخر 1447"],
+    ["١٤٤٧-٠٢", "١٤٤٧-٠٣", "١٤٤٧-٠٤"],
+    ["1447-02-01", "1447-03-01", "1447-04-01"],
+    ["1446", "1447", "1448"],
+])
+@pytest.mark.parametrize("chart", ["line", "column"])
+@pytest.mark.parametrize("direction", ["ltr", "rtl"])
+@pytest.mark.parametrize("sort", [None, "none"])
+def test_hijri_time_labels_and_analyst_order_are_preserved(values, chart, direction, sort):
+    columns = [column("period", "time"), column("value", "measure")]
+    result = table(columns, [[label, value] for label, value in zip(values, [20, 10, 30])])
+    role = "time" if chart == "line" else "category"
+    spec = Spec(type=chart, bind={role: "period", "value": "value"},
+                language="ar", direction=direction, sort=sort)
+    resolved = resolve(spec, columns, result)
+    assert resolved.config["data"] == [
+        {role: label, "value": value} for label, value in result.rows
+    ]
+    assert "domain" not in resolved.overrides.get("scale", {}).get("x", {})
+    assert [row[0] for row in result.rows] == values
+
+
+@pytest.mark.parametrize("value", [
+    "1447-03-01", "1599-01-01T00:00:00", "١٤٤٧-٠٣-٠١", "٢٠٢٤-٠٣-٠١",
+    "2024-03-01T٠٠:00:00", "ربيع الأول 1447", "March 2024",
+])
+def test_one_non_gregorian_label_keeps_the_whole_time_column_unchanged(value):
+    columns = [column("period", "time"), column("value", "measure")]
+    result = table(columns, [["2024-02-01T00:00:00", 20], [value, 10]])
+    spec = Spec(type="line", bind={"time": "period", "value": "value"}, sort="none")
+    resolved = resolve(spec, columns, result)
+    assert resolved.config["data"] == [
+        {"time": label, "value": measure} for label, measure in result.rows
+    ]
+
+
+@pytest.mark.parametrize("year", ["1600", "2024"])
+def test_gregorian_monthly_series_still_shortens_in_analyst_order(year):
+    columns = [column("period", "time"), column("value", "measure")]
+    result = table(columns, [[f"{year}-02-01", 20], [f"{year}-03-01", 10]])
+    spec = Spec(type="line", bind={"time": "period", "value": "value"},
+                sort="none", direction="rtl")
+    resolved = resolve(spec, columns, result)
+    assert resolved.config["data"] == [
+        {"time": f"{year}-02-01", "value": 20}, {"time": f"{year}-03-01", "value": 10},
+    ]
+    assert "domain" not in resolved.overrides.get("scale", {}).get("x", {})
+
+
+def test_numeric_categories_and_groups_use_text_for_sort_rtl_emphasis_and_other():
+    columns, _ = cities()
+    result = table(columns, [[2, 20], [10.0, 30], [1.25, 10], ["2.0", 5]])
+    resolved = resolve(city_spec(sort="category asc", language="ar", emphasis=["10"]), columns, result)
+    assert [r["category"] for r in resolved.config["data"]] == [1.25, 10.0, 2, "2.0"]
+    assert resolved.overrides["scale"]["x"]["domain"] == ["2.0", 2, 10.0, 1.25]
+    assert resolved.config["style"]["palette"] == ["#C9CDD4", "#1783FF", "#C9CDD4", "#C9CDD4"]
+    folded = resolve(city_spec(limit=1), columns, result)
+    assert folded.config["data"] == [{"category": 10.0, "value": 30}, {"category": "Other", "value": 35}]
+    columns, result = grouped(1)
+    result.rows[0][1], result.rows[1][1] = 1, 2.0
+    resolved = resolve(group_spec(emphasis=["2"]), columns, result)
+    assert [r["group"] for r in resolved.config["data"]] == [1, 2.0]
+    assert resolved.config["style"]["palette"] == ["#C9CDD4", "#1783FF"]
+
+
+@pytest.mark.parametrize("meanings,expected", [
+    (["Region", "Total", "Share"], ["Region", "Total", "Share"]),
+    (["", "  ", "Share"], ["a", "b", "Share"]),
+    (["Repeated", "Repeated", "Share"], ["a", "b", "Share"]),
+    (["b", "", "Share"], ["a", "b", "Share"]),
+    (["b", "Same", "Same"], ["a", "b", "c"]),
+])
+def test_table_headers_are_display_metadata_without_changing_column_keys(meanings, expected):
+    columns = [column(name, "measure") for name in ["a", "b", "c"]]
+    for c, meaning in zip(columns, meanings):
+        c.meaning = meaning
+    result = table(columns, [[1, 2, 3]])
+    resolved = resolve(Spec(type="table"), columns[::-1], result)
+    assert resolved.config["columns"] == ["a", "b", "c"]
+    assert resolved.config["data"] == [{"a": 1, "b": 2, "c": 3}]
+    assert resolved.display["columns"] == {c.name: c.meaning.strip() or c.name for c in columns}
+
+
+@pytest.mark.parametrize("unit,expected", [("count", None), (" COUNTS ", None), ("number", None),
+                                         ("N", None), ("عدد", None), ("رقم", None), ("SAR", "SAR")])
+def test_inherited_count_units_are_removed_from_charts_and_tables(unit, expected):
+    columns, result = gender_share()
+    columns[2].unit = unit
+    spec = Spec(type="column", bind={"category": "label", "value": "n"})
+    assert resolve(spec, columns, result).number.unit == expected
+    spec.format = "0.0"
+    assert resolve(spec, columns, result).number.unit == expected
+    spec.format = "0.0 count"
+    assert resolve(spec, columns, result).number.unit == "count"
+    resolved = resolve(Spec(type="table", digits="arabic", format="0.0 SAR"), columns, result)
+    assert resolved.table_formats["n"] == NumberFormat(unit=expected, digits="arabic").model_dump()
+    assert resolved.table_formats["share"]["unit"] == "%"
+
+
+@pytest.mark.parametrize("chart,builder,bindings", [
+    ("column", cities, {"category": "city", "value": "violations"}),
+    ("bar", cities, {"category": "city", "value": "violations"}),
+    ("line", monthly, {"time": "month", "value": "visits"}),
+    ("area", monthly, {"time": "month", "value": "visits"}),
+    ("scatter", scatter_points, {"x": "age", "y": "amount"}),
+    ("histogram", raw_amounts, {"value": "amount"}),
+    ("boxplot", cities, {"category": "city", "value": "violations"}),
+])
+def test_single_series_palette_preserves_the_designers_explicit_colours(chart, builder, bindings):
+    spec = Spec(type=chart, bind=bindings, palette=["#1F4E79", "#C0504D"])
+    assert resolve(spec, *builder()).config["style"]["palette"] == ["#1F4E79", "#C0504D"]
+    assert spec.palette == ["#1F4E79", "#C0504D"]
+
+
+@pytest.mark.parametrize("chart", ["pie", "donut", "treemap", "word_cloud", "radar"])
+def test_category_colour_palettes_keep_all_colours(chart):
+    palette = ["#1F4E79", "#C0504D"]
+    assert resolve(city_spec(chart, palette=palette), *cities(2)).config["style"]["palette"] == palette
+
+
+@pytest.mark.parametrize("chart", ["bar", "grouped_bar", "stacked_bar", "column"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_axis_titles_follow_screen_axes(chart, explicit):
+    spec, data = (group_spec(chart), grouped()) if "_" in chart else (city_spec(chart), cities())
+    if explicit:
+        spec.axis_x_title, spec.axis_y_title = "Share (%)", "Region"
+    config = resolve(spec, *data).config
+    expected = ("city", spec.bind["value"])
+    if explicit:
+        expected = ("Share (%)", "Region") if chart == "column" else ("Region", "Share (%)")
+    assert (config["axisXTitle"], config["axisYTitle"]) == expected
+
+
+@pytest.mark.parametrize("x,y,expected", [(None, None, "%"), ("Share", None, "Share"), (None, "Region", "%")])
+def test_percent_bar_default_title_is_on_horizontal_value_axis(x, y, expected):
+    config = resolve(group_spec("stacked_bar", percent=True, axis_x_title=x, axis_y_title=y), *grouped()).config
+    assert config["axisXTitle"] == (y if y is not None else "city")
+    assert config["axisYTitle"] == expected
+
+
+@pytest.mark.parametrize("chart,builder,bindings", [
+    ("radar", grouped, {"category": "city", "group": "gender", "value": "n"}),
+    ("dual_axes", two_units, {"category": "month", "value": "visits", "value2": "revenue"}),
+    ("table", cities, {}),
+])
+def test_labels_on_reports_unsupported_mark_structure(chart, builder, bindings):
+    resolved = resolve(Spec(type=chart, bind=bindings, labels="on"), *builder())
+    assert any(c.key == "labels" for c in resolved.compromises)
+    assert "labels" not in resolved.overrides
+
+
+@pytest.mark.parametrize("chart,builder,bindings,field", [
+    ("pie", cities, {"category": "city", "value": "violations"}, "value"),
+    ("donut", cities, {"category": "city", "value": "violations"}, "value"),
+    ("bar", cities, {"category": "city", "value": "violations"}, "value"),
+    ("scatter", scatter_points, {"x": "age", "y": "amount"}, "y"),
+])
+def test_label_toggle_supplies_only_a_fallback_for_the_adapter(chart, builder, bindings, field):
+    spec = Spec(type=chart, bind=bindings, labels="on")
+    resolved = resolve(spec, *builder())
+    # Placement/collision defaults belong to the pinned package, not the resolver.
+    assert resolved.overrides["labels"] == [{"text": field}]
+    assert "labels" not in resolved.config
+    assert resolve(spec.model_copy(update={"labels": "off"}), *builder()).overrides["labels"] == []
+
+
+@pytest.mark.parametrize("chart, role", [("line", "time"), ("column", "category")])
+def test_gregorian_time_is_drawn_in_order_whatever_the_analyst_returned(chart, role):
+    columns = [column("period", "time"), column("value", "measure")]
+    result = table(columns, [["2026", 5], ["2024", 20], ["2025", 10]])
+    spec = Spec(type=chart, bind={role: "period", "value": "value"}, sort="none")
+    resolved = resolve(spec, columns, result)
+    assert [record[role] for record in resolved.config["data"]] == ["2024", "2025", "2026"]
+
+
+def test_integer_years_bound_as_time_are_drawn_in_order():
+    columns = [column("year", "ordinal"), column("value", "measure")]
+    result = table(columns, [[2026, 5], [2025, 10], [2024, 20]])
+    spec = Spec(type="line", bind={"time": "year", "value": "value"})
+    resolved = resolve(spec, columns, result)
+    assert [record["time"] for record in resolved.config["data"]] == [2024, 2025, 2026]
+
+
+@pytest.mark.parametrize("values", [
+    ["1447-04", "1447-03", "1447-02"], ["١٤٤٧-٠٤", "١٤٤٧-٠٣"], ["ربيع الآخر 1447", "صفر 1447"],
+])
+def test_hijri_time_keeps_the_analyst_order(values):
+    columns = [column("period", "time"), column("value", "measure")]
+    result = table(columns, [[label, 10] for label in values])
+    spec = Spec(type="line", bind={"time": "period", "value": "value"})
+    resolved = resolve(spec, columns, result)
+    assert [record["time"] for record in resolved.config["data"]] == values
+
+
+from vis_agent.analyst.models import ResultColumn
+from vis_agent.designer.rules import ACCENT
+
+
+def test_a_single_series_gets_one_colour():
+    columns, result = cities()
+    assert resolve(city_spec(), columns, result).config["style"]["palette"] == [ACCENT]
+    columns, result = grouped()
+    assert "palette" not in resolve(group_spec(), columns, result).config.get("style", {})
+
+
+def test_generic_count_markers_leave_the_axis_and_a_named_noun_stays():
+    columns, result = cities()
+    columns[1] = column("violations", "measure", aggregate="count", unit="count")
+    assert resolve(city_spec(), columns, result).number.unit is None
+    columns[1] = column("violations", "measure", aggregate="count", unit="شخص")
+    assert resolve(city_spec(), columns, result).number.unit == "شخص"
+    columns[1] = column("violations", "measure", aggregate="sum", unit="SAR")
+    assert resolve(city_spec(), columns, result).number.unit == "SAR"
+
+
+def test_tiny_values_get_enough_decimals():
+    columns, _ = cities(3)
+    tiny = table(columns, [["A", 0.0004], ["B", 0.0002], ["C", 0.0001]], types=["VARCHAR", "DOUBLE"])
+    assert resolve(city_spec(), columns, tiny).number.decimals == 5
+    assert resolve(city_spec(), *cities()).number.decimals is None
+
+
+def test_axis_titles_follow_the_column_they_name():
+    columns, result = cities()
+    right = resolve(city_spec("bar", axis_x_title="number of violations", axis_y_title="city"), columns, result).config
+    swapped = resolve(city_spec("bar", axis_x_title="city", axis_y_title="number of violations"), columns, result).config
+    assert (right["axisXTitle"], right["axisYTitle"]) == ("city", "number of violations")
+    assert (swapped["axisXTitle"], swapped["axisYTitle"]) == ("city", "number of violations")
+    plain = resolve(city_spec("column", axis_x_title="city", axis_y_title="number of violations"), columns, result).config
+    assert (plain["axisXTitle"], plain["axisYTitle"]) == ("city", "number of violations")
+
+
+def test_a_wide_table_widens_and_records_its_long_headers():
+    columns, result = cities(2)
+    columns[1] = ResultColumn(name="violations", meaning="عدد السكان من الفئة العمرية 15 إلى 24 سنة", kind="measure",
+                              aggregate="count")
+    resolved = resolve(Spec(type="table"), columns, result)
+    assert resolved.width > 800 and [c.key for c in resolved.compromises] == ["headers"]
+    assert resolve(Spec(type="table"), *cities(2)).width == 800
+
+
+def test_the_direction_compromise_needs_an_explicit_direction():
+    columns, result = cities()
+    by_default = resolve(city_spec(language="ar"), columns, result)
+    explicit = resolve(city_spec(language="ar", direction="rtl"), columns, result)
+    assert "direction" not in [c.key for c in by_default.compromises]
+    assert "direction" in [c.key for c in explicit.compromises]
+    assert by_default.overrides["title"]["align"] == "right"

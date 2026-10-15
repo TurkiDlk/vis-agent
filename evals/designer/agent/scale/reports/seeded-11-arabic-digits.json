@@ -1,0 +1,91 @@
+{
+  "dataset_id": "ds_5cfeee609ca24e25ab91d2bef0c86de3",
+  "question": "اعرض قيم «count» حسب «age_group».",
+  "language": "Arabic",
+  "brief_fingerprint": null,
+  "analysis": {
+    "sql": "SELECT age_group, CAST(replace(translate(count, '٠١٢٣٤٥٦٧٨٩٫٬', '0123456789.,'), ',', '') AS DOUBLE) AS \"العدد\" FROM \"ds_5cfeee609ca24e25ab91d2bef0c86de3\"",
+    "columns": [
+      {
+        "name": "age_group",
+        "meaning": "الفئة العمرية",
+        "kind": "ordinal",
+        "unit": null,
+        "source": "age_group",
+        "aggregate": "none",
+        "denominator": "null"
+      },
+      {
+        "name": "العدد",
+        "meaning": "عدد الأفراد",
+        "kind": "measure",
+        "unit": null,
+        "source": "count",
+        "aggregate": "none",
+        "denominator": "null"
+      }
+    ],
+    "summary": "توضح البيانات عدد الأفراد حسب الفئة العمرية، حيث سجلت فئة «غير محدد» أعلى عدد بـ 12,893 شخصاً، تليها فئة «+65» بـ 12,548 شخصاً.",
+    "assumptions": [
+      "تم تحويل الأرقام المكتوبة بالخط العربي-الهندي إلى أرقام عربية قياسية لإجراء العرض."
+    ]
+  },
+  "clarification": null,
+  "result": {
+    "sql": "SELECT age_group, CAST(replace(translate(count, '٠١٢٣٤٥٦٧٨٩٫٬', '0123456789.,'), ',', '') AS DOUBLE) AS \"العدد\" FROM \"ds_5cfeee609ca24e25ab91d2bef0c86de3\"",
+    "columns": [
+      "age_group",
+      "العدد"
+    ],
+    "types": [
+      "VARCHAR",
+      "DOUBLE"
+    ],
+    "rows": [
+      [
+        "15-24",
+        8748.0
+      ],
+      [
+        "25-34",
+        8754.0
+      ],
+      [
+        "35-44",
+        8644.0
+      ],
+      [
+        "45-54",
+        8705.0
+      ],
+      [
+        "55-64",
+        8642.0
+      ],
+      [
+        "65+",
+        12548.0
+      ],
+      [
+        "غير محدد",
+        12893.0
+      ]
+    ],
+    "row_count": 7,
+    "checks": [],
+    "seconds": 0.013867750007193536
+  },
+  "checks": [
+    {
+      "column": null,
+      "check": "summary_numbers_exist",
+      "severity": "error",
+      "passed": true,
+      "message": "ok"
+    }
+  ],
+  "warnings": [],
+  "model": "google/gemma-4-31b-it",
+  "seconds": 4.170043917009025,
+  "created_at": "2026-09-07T20:44:11.118615Z"
+}

@@ -1,0 +1,365 @@
+"""Catalogue filters, scores, and written-spec checks as small pure rules."""
+
+import re
+from dataclasses import dataclass
+
+from vis_agent.models import Intent
+
+from .catalogue import CATALOGUE, CatalogueEntry
+from .models import Spec, Violation
+from .shape import ColumnShape, ResultShape
+
+STACKED = {"stacked_column", "stacked_bar", "stacked_area"}
+BARS = {"bar", "grouped_bar", "stacked_bar"}
+COLUMNS = {"column", "grouped_column", "stacked_column"}
+LINES = {"line", "multi_line"}
+ADDITIVE = {"sum", "count", "count_distinct"}
+
+
+@dataclass
+class Context:
+    intent: Intent | None = None
+    suggested: str | None = None
+
+
+@dataclass
+class RuleResult:
+    rule: str
+    score: int
+    explanation: str
+    fix: str
+    hard: bool = False
+
+
+def offered(shape) -> str:
+    """The result's columns with their kinds and units, for a message that says what is actually there."""
+    return ", ".join(f"{c.name} ({c.kind}{', ' + c.unit if c.unit else ''})" for c in shape.columns)
+
+
+def missing_roles(entry, shape) -> str:
+    needs = ", ".join(f"{name} ({'/'.join(role.kinds)})" for name, role in entry.roles.items() if role.required)
+    return f"{entry.name} needs {needs}; the result offers {offered(shape)}. Choose a chart that fits these columns."
+
+
+def _additive(value):
+    return value is not None and (value.aggregate in ADDITIVE or value.kind == "share")
+
+
+def h1_shape(entry, shape, binding, context):
+    if any((role.required and name not in binding) or
+           (name in binding and binding[name].kind not in role.kinds)
+           for name, role in entry.roles.items()):
+        return RuleResult("H1", 0, "Required roles need columns of allowed kinds.", "Choose a chart that fits the columns", True)
+
+
+def h2_time_kept(entry, shape, binding, context):
+    if shape.times and entry.name not in ("table", "indicator") and not any(c.kind == "time" for c in binding.values()):
+        return RuleResult("H2", 0, "The time column is left unbound.", "Bind the time column", True)
+
+
+def h3_whole(entry, shape, binding, context):
+    if entry.additive_value and "value" in binding and not _additive(binding["value"]):
+        return RuleResult("H3", 0, "This chart needs an additive value or share.", "Use a bar for an average", True)
+
+
+def h4_sign(entry, shape, binding, context):
+    if entry.name in {"pie", "donut", "treemap"} | STACKED and "value" in binding and binding["value"].has_negative:
+        return RuleResult("H4", 0, "Parts of a whole cannot be negative.", "Use a bar or a line", True)
+
+
+def h5_slices(entry, shape, binding, context):
+    category = binding.get("category")
+    if category and ((entry.category_min is not None and category.distinct < entry.category_min) or
+                     (entry.category_max is not None and entry.category_max != 50 and category.distinct > entry.category_max)):
+        return RuleResult("H5", 0, f"{category.distinct} categories fall outside this chart's limits.", "Use a sorted bar", True)
+
+
+def h6_colors(entry, shape, binding, context):
+    group = binding.get("group")
+    if group and entry.group_max is not None and group.distinct > entry.group_max:
+        return RuleResult("H6", 0, f"{group.distinct} groups exceed the limit of {entry.group_max}.", "Keep the top groups", True)
+
+
+def h7_points(entry, shape, binding, context):
+    time = binding.get("time")
+    if time and entry.min_points is not None and time.distinct < entry.min_points:
+        return RuleResult("H7", 0, f"The time axis needs at least {entry.min_points} points.", "Use a bar", True)
+
+
+def h8_order(entry, shape, binding, context):
+    time = binding.get("time")
+    if time and time.kind not in ("time", "ordinal"):
+        return RuleResult("H8", 0, "The horizontal axis needs time or ordinal values.", "Use a bar", True)
+
+
+def h9_raw(entry, shape, binding, context):
+    value = binding.get("value")
+    if entry.raw_values and ((entry.min_rows is not None and shape.rows < entry.min_rows) or
+                             (value is not None and value.aggregate != "none")):
+        return RuleResult("H9", 0, f"This chart needs at least {entry.min_rows} rows of unaggregated values.", "Use a bar of the aggregate", True)
+
+
+def h10_units(entry, shape, binding, context):
+    """Two measures of one unit belong on one axis. Two measures with no unit written are one scale only when they
+    are aggregated the same way: a count beside an average is two scales, whatever the analyst left unwritten."""
+    if entry.name != "dual_axes" or "value" not in binding or "value2" not in binding:
+        return None
+    first, second = binding["value"], binding["value2"]
+    same_scale = first.unit == second.unit and (first.unit is not None or first.aggregate == second.aggregate)
+    if same_scale:
+        return RuleResult("H10", 0, "The two measures have the same unit.", "Fold them into one series: a multi_line or grouped_column with fold", True)
+
+
+def h11_many(entry, shape, binding, context):
+    category = binding.get("category")
+    if entry.category_max == 50 and category and category.distinct > 50:
+        return RuleResult("H11", 0, f"{category.distinct} categories exceed fifty.", "Keep the top twenty with Other, or a table", True)
+
+
+def h12_empty(entry, shape, binding, context):
+    if shape.rows == 0:
+        return RuleResult("H12", 0, "The result is empty.", "Ask, do not draw", True)
+
+
+def h13_alias(entry, shape, binding, context):
+    category, group = binding.get("category"), binding.get("group")
+    if "group" in entry.roles and category and group and shape.is_alias(category.name, group.name):
+        return RuleResult("H13", 0, "The group is a label of the category.",
+                          "Bind the label as category and drop the group", True)
+
+
+def h14_whole(entry, shape, binding, context):
+    if entry.name in {"pie", "donut", "treemap"} and any(
+        c.kind == "share" and c.sums_to_whole is False for c in shape.measures
+    ):
+        return RuleResult("H14", 0, "The shares are of different wholes; they do not add up to one.",
+                          "Use a bar", True)
+
+
+def s1_intent(entry, shape, binding, context):
+    if entry.name != "table" and context.intent in entry.purposes:
+        return RuleResult("S1", 3, f"This chart serves the {context.intent} intent.", "")
+
+
+def s2_suggested(entry, shape, binding, context):
+    if entry.name == "indicator" and context.intent not in (None, "summary", "share"):
+        return None
+    if context.suggested and CATALOGUE.find(context.suggested) == entry:
+        return RuleResult("S2", 3, "This chart matches the suggested chart.", "")
+
+
+def s3_caution(entry, shape, binding, context):
+    if entry.rating == "caution":
+        return RuleResult("S3", -1, "The catalogue rates this chart use with caution.", "")
+
+
+def s4_count(entry, shape, binding, context):
+    category = binding.get("category")
+    if entry.name in BARS | COLUMNS and category:
+        count = category.distinct
+        score = 1 if count <= 12 else 0 if count <= 20 else -2
+        return RuleResult("S4", score, f"{count} categories {'fit' if count <= 20 else 'crowd'} a {entry.name}.",
+                          "sort and keep the top N with Other" if count > 20 else "")
+
+
+def s5_long_labels(entry, shape, binding, context):
+    category = binding.get("category")
+    if category and category.longest_label > 15:
+        if entry.name in BARS:
+            return RuleResult("S5", 1, "Long category labels read well on horizontal bars.", "")
+        if entry.name in COLUMNS:
+            return RuleResult("S5", -2, "Long category labels crowd vertical columns.", "use a horizontal bar")
+
+
+def s6_balance(entry, shape, binding, context):
+    value = binding.get("value")
+    if entry.name in ("pie", "donut") and value and value.minimum is not None and value.maximum is not None and value.minimum >= 0.9 * value.maximum:
+        return RuleResult("S6", -2, "Slices within ten percent of the largest are hard to compare.", "use a sorted bar")
+
+
+def s7_time_reads(entry, shape, binding, context):
+    axis = binding.get("time") or binding.get("category")
+    if axis and axis.kind == "time":
+        if entry.name in LINES | {"area", "stacked_area"}:
+            return RuleResult("S7", 2, "A line or area makes time easy to read.", "")
+        if entry.name in BARS:
+            return RuleResult("S7", -2, "Time is harder to read on horizontal bars.", "")
+
+
+def s8_composition(entry, shape, binding, context):
+    if (entry.name in STACKED and context.intent == "composition") or (entry.name in {"grouped_column", "grouped_bar"} and context.intent == "compare"):
+        return RuleResult("S8", 1, "The series arrangement supports the requested comparison.", "")
+
+
+def s9_unbound(entry, shape, binding, context):
+    if entry.name in ("table", "indicator"):
+        return None
+    bound = {c.name for c in binding.values()}
+    sources = {c.source for c in binding.values() if c.kind in ("category", "ordinal", "geography") and c.source is not None}
+    unbound = [c.name for c in shape.measures if c.name not in bound]
+    unbound += [c.name for c in shape.labels if c.name not in bound and (c.source is None or c.source not in sources)]
+    unbound = [name for name in unbound if not any(shape.is_alias(name, other) for other in bound)]
+    return RuleResult("S9", -len(unbound),
+                      f"Unbound columns: {', '.join(unbound)}." if unbound else "Every measure and independent label is bound.", "")
+
+
+def s10_few_points(entry, shape, binding, context):
+    if entry.name == "scatter" and shape.rows < 10:
+        return RuleResult("S10", -2, "Fewer than ten points give little evidence of a relationship.", "")
+
+
+def s11_words(entry, shape, binding, context):
+    if entry.name == "word_cloud" and "category" in binding and binding["category"].distinct < 20:
+        return RuleResult("S11", -3, "Fewer than twenty categories give a sparse word cloud.", "")
+
+
+def s12_fallback(entry, shape, binding, context):
+    if entry.name == "table":
+        return RuleResult("S12", 0, "A table can show every result column.", "")
+
+
+def s13_one_number(entry, shape, binding, context):
+    if shape.rows != 1 or not shape.measures:
+        return None
+    if context.intent == "summary":
+        return RuleResult("S13", 3 if entry.name == "indicator" else 0,
+                          "Headline measurements suit an indicator when the question asks for a summary.", "")
+    if entry.name == "indicator":
+        return RuleResult("S13", 1 if context.intent == "share" else -3,
+                          "A single row is eligible; the question must justify a headline metric.", "")
+    if len(shape.measures) == 1 and context.intent is None:
+        return RuleResult("S13", 2 if entry.name == "table" else 0,
+                          "Without a summary intent, a table preserves the scalar result and its context.", "")
+
+
+def s14_few_parts(entry, shape, binding, context):
+    category = binding.get("category")
+    if entry.name == "treemap" and category and category.distinct <= 7:
+        return RuleResult("S14", -2, "few parts read better as a pie or a bar", "use a pie, a donut, or a bar")
+
+
+HARD_RULES = [h1_shape, h2_time_kept, h3_whole, h4_sign, h5_slices, h6_colors,
+              h7_points, h8_order, h9_raw, h10_units, h11_many, h12_empty, h13_alias, h14_whole]
+SOFT_RULES = [s1_intent, s2_suggested, s3_caution, s4_count, s5_long_labels, s6_balance,
+              s7_time_reads, s8_composition, s9_unbound, s10_few_points, s11_words,
+              s12_fallback, s13_one_number, s14_few_parts]
+
+
+_HEX = re.compile(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})\Z")
+# GPT-Vis SSR dist/cjs/theme.js and Task 5's emphasis default.
+ACCENT = "#1783FF"
+THEME_BACKGROUNDS = {"default": "#FFFFFF", "academy": "#FFFFFF", "dark": "#000000"}
+
+
+def _luminance(color):
+    digits = color[1:]
+    if len(digits) == 3:
+        digits = "".join(c * 2 for c in digits)
+    channels = [int(digits[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    return sum(c * weight for c, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+
+
+def _contrast(color, background):
+    first, second = sorted((_luminance(color), _luminance(background)))
+    return (second + 0.05) / (first + 0.05)
+
+
+def check_rules(
+    entry: CatalogueEntry, spec: Spec, shape: ResultShape, binding: dict[str, ColumnShape],
+) -> list[Violation]:
+    """Collect semantic errors; syntax owns C17 and check records its warning."""
+    violations = []
+
+    def fail(rule, message, fix):
+        violations.append(Violation(rule=rule, message=message, fix=fix))
+
+    axis = binding.get("time") or binding.get("category")
+    ordered = axis is not None and axis.kind in ("time", "ordinal")
+    sort = spec.sort or ("none" if ordered else "value desc")
+    value = binding.get("value")
+    if ordered and sort != "none":
+        fail("C4", "Sort must be none on a time or ordinal axis.", "Remove the sort")
+    if spec.sort and spec.sort != "none" and spec.sort.split()[0] not in binding:
+        fail("C18", "The sort target must be a bound role.", "Remove the sort")
+    if spec.limit is not None and spec.limit < 1:
+        fail("C19", "A limit must be at least 1.", "Use a limit of 1 or more")
+    valid_limit = (spec.limit is not None and spec.limit >= 1 and axis is not None and
+                   not ordered and sort in ("value asc", "value desc") and _additive(value) and
+                   ("value2" not in binding or _additive(binding["value2"])))
+    if spec.limit is not None and (axis is None or sort not in ("value asc", "value desc") or
+                                   not _additive(value) or
+                                   ("value2" in binding and not _additive(binding["value2"]))):
+        fail("C5", "A limit needs a category axis, a value sort, and additive values for Other.", "Sort by value, or drop the limit")
+
+    category = binding.get("category")
+    displayed = shape.limited(axis.name, spec.limit) if valid_limit else shape
+    displayed_binding = {role: displayed.column(c.name) for role, c in binding.items()}
+    color = displayed_binding.get("group") if "group" in entry.roles else None
+    if color is None and entry.name in {"pie", "donut", "treemap", "word_cloud"}:
+        color = displayed_binding.get("category")
+    color_count = color.distinct if color else 2 if entry.name == "dual_axes" else 1
+    if spec.palette and (any(not _HEX.fullmatch(c) for c in spec.palette) or
+                         len(spec.palette) < color_count):
+        fail("C6", "Palette entries must be hex colors, with a color for each coloured group, category, or series.", "Add colors or drop the palette")
+    background = spec.background_color or THEME_BACKGROUNDS[spec.theme]
+    colors = [c for c in spec.palette if _HEX.fullmatch(c)]
+    if spec.emphasis:
+        colors.append(ACCENT)
+    if not _HEX.fullmatch(background):
+        fail("C7", "The background must be a hex color to check contrast.", "Pick a darker or lighter color")
+    elif any(_contrast(c, background) < 3 for c in colors):
+        fail("C7", "Every palette color and the accent need at least 3 to 1 contrast with the background.", "Pick a darker or lighter color")
+    if not spec.title or not spec.title.strip() or not spec.description or not spec.description.strip():
+        fail("C8", "A title and a description are required.", "Write them")
+    known = shape._label_values.get(category.name, set()) if category else set()
+    group = binding.get("group") if "group" in entry.roles else None
+    if group is not None:
+        known = known | shape._label_values.get(group.name, set())
+    if any(label not in known for label in spec.emphasis):
+        target = "category or group" if group is not None else "category"
+        fail("C9", f"Every emphasised value must exist in the bound {target}.", "Fix the spelling")
+    for rule in HARD_RULES:
+        if rule is h1_shape:
+            continue
+        result = rule(entry, displayed, displayed_binding, Context())
+        if result is not None:
+            fail("C10", f"{result.rule}: {result.explanation}", result.fix)
+
+    y_values = [binding[r] for r in ("value", "value2", "y") if r in binding]
+    ranges = [
+        ("Y", spec.axis_y_min, spec.axis_y_max, {"line", "multi_line", "scatter", "boxplot", "dual_axes"}, y_values),
+        ("X", spec.axis_x_min, spec.axis_x_max, {"scatter"}, [binding["x"]] if "x" in binding else []),
+    ]
+    for axis_name, lower, upper, allowed, plotted in ranges:
+        if lower is None and upper is None:
+            continue
+        fix = "Widen the range or drop it"
+        if entry.name not in allowed:
+            fail("C11", f"axis{axis_name}Min and axis{axis_name}Max are allowed only on {', '.join(sorted(allowed))}.", fix)
+        if lower is not None and upper is not None and lower >= upper:
+            fail("C11", f"The {axis_name} minimum must be below the maximum.", fix)
+        if any((lower is not None and c.minimum is not None and c.minimum < lower) or
+               (upper is not None and c.maximum is not None and c.maximum > upper) for c in plotted):
+            fail("C11", "Every plotted value must be inside the range.", fix)
+    if entry.name in LINES and (spec.zero is False or (spec.axis_y_min is not None and spec.axis_y_min > 0)):
+        if value is None or value.minimum is None or value.maximum is None or not (value.maximum > 0 and value.minimum > 0.5 * value.maximum):
+            fail("C12", "A cropped line needs positive values with the smallest above half the largest.", "Start at zero")
+    if spec.percent and (entry.name not in STACKED or not _additive(value) or value.has_negative):
+        fail("C13", "Percent needs a stacked chart and a nonnegative additive value.", "Drop it, or use a share the analyst computed")
+    if spec.axis_y_scale == "log":
+        if entry.name not in LINES | {"scatter"} or not y_values or any(
+            not c.is_numeric or c.minimum is None or c.maximum is None or c.minimum <= 0 or c.maximum < 100 * c.minimum
+            for c in y_values
+        ):
+            fail("C14", "Log needs line, multi_line, or scatter with positive values spanning at least a factor of one hundred.", "Use linear")
+    marks = shape.rows
+    if category is not None and (entry.name in BARS | COLUMNS or valid_limit):
+        marks = min(shape.rows, displayed_binding["category"].distinct *
+                    (binding["group"].distinct if "group" in binding else 1))
+    label_limit = 12 if entry.name in BARS | COLUMNS else 50
+    if spec.labels == "on" and marks > label_limit:
+        fail("C15", f"More than {label_limit} marks crowd the data labels.", "Turn them off, or limit the rows")
+    if spec.zero is True and spec.axis_y_min is not None and spec.axis_y_min != 0:
+        fail("C16", "zero true contradicts a nonzero axisYMin.", "Drop one")
+    return violations
