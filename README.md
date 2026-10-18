@@ -241,3 +241,6 @@ uv run python -m evals.reviewer.run
 Earlier phase designs under `docs/superpowers/` record the previous architecture. The current design is
 [lead-directed visualization](docs/lead-directed-team.md). `TemporalDurability` remains attached as a
 capability; ordinary web runs do not use a Temporal worker.
+
+Charts are reviewed against the checklist in [docs/visualization-standards.md](docs/visualization-standards.md).
+Problems found are logged against those rules in [docs/chart-issues](docs/chart-issues/README.md).
