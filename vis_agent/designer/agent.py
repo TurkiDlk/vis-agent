@@ -24,6 +24,7 @@ from vis_agent.models import DataBrief, DisplayLabels, Intent, QuestionAnswer
 from vis_agent.model_settings import text_specialist_settings
 from vis_agent.render import gptvis
 from vis_agent.render.base import RENDERERS, Rendered
+from vis_agent.tracing import CallLedger
 
 from . import models
 from .catalogue import CATALOGUE
@@ -308,6 +309,7 @@ def create_designer(model: str | Model) -> Agent[DesignerDeps, Design]:
         retries={"output": 2},
         instructions=instructions(),
         model_settings=text_specialist_settings(model),
+        capabilities=[CallLedger()],
     )
     agent.tool(check_spec, retries=1, prepare=offer_check_spec)
     agent.tool_plain(chart_capabilities)

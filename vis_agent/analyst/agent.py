@@ -31,6 +31,7 @@ from vis_agent.profiler.agent import DEFAULT_PROFILER_MODEL, ProfilerInput, meas
 from vis_agent.profiler.models import DatasetProfile, ProfileCheck, SemanticProfile
 from vis_agent.profiler.review import failed_checks
 from vis_agent.store import DatasetNotFound, DatasetStore, quote_identifier
+from vis_agent.tracing import CallLedger
 from vis_agent.units import canonical_unit
 
 log = logging.getLogger("analyst")
@@ -280,6 +281,7 @@ def create_analyst(model: str | Model) -> Agent[AnalystDeps, Analysis | Clarific
         retries={"output": 2},
         instructions=ANALYST_INSTRUCTIONS + "\n\n" + LABEL_INSTRUCTIONS,
         model_settings=text_specialist_settings(model),
+        capabilities=[CallLedger()],
     )
     agent.tool(run_query, retries=1, prepare=offer_run_query)
 

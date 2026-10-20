@@ -26,6 +26,7 @@ from vis_agent.profiler.models import (
     SemanticProfile,
 )
 from vis_agent.profiler.review import failed_checks, run_checks
+from vis_agent.tracing import CallLedger
 
 log = logging.getLogger("profiler")
 SEMANTIC_TIMEOUT_SECONDS = 90
@@ -75,6 +76,7 @@ def create_profiler(model: str | Model) -> Agent[ProfilerInput, SemanticProfile]
         retries={"output": 2},
         instructions=PROFILER_INSTRUCTIONS,
         model_settings=text_specialist_settings(model),
+        capabilities=[CallLedger()],
     )
 
     return agent

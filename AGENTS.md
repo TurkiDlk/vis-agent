@@ -32,6 +32,8 @@ The current design is `docs/lead-directed-team.md`. Earlier phase designs under
 - `vis_agent/analyst/source.py`: read the original CSV for direct charting without model calls.
 - `vis_agent/requests/service.py`: request persistence, publication, and API/CLI entry point to the same lead.
 - `vis_agent/requests/runner.py`: compatibility imports only; no flow control.
+- `vis_agent/tracing.py`: Logfire setup, the local span file, and `CallLedger`, which every agent carries so each
+  `chat` span has its number in the shared request budget. `uv run vis trace` reads the file (`trace_report.py`).
 - `vis_agent/requests/models.py` and `store.py`: saved tool results and linked artifact versions.
 - `vis_agent/designer/`, `analyst/`, `profiler/`, `reviewer/`: existing domain specialists.
 - `vis_agent/render/`: the pinned GPT-Vis renderer. Node 22 LTS on PATH and

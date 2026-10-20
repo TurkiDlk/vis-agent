@@ -36,6 +36,7 @@ from vis_agent.requests.service import (
 )
 from vis_agent.requests.store import ArtifactNotFound, RequestNotFound
 from vis_agent.store import DatasetNotFound
+from vis_agent.tracing import CallLedger
 
 MAX_LISTED_DATASETS = 20
 MAX_LISTED_ARTIFACTS = 20
@@ -658,7 +659,7 @@ async def require_finished_preview(ctx: RunContext[AppDeps], text: str) -> str:
 
 def create_lead(model: str | Model, advisor_model: str | None = None, *, model_settings=None,
                 instructions: str | None = None) -> Agent[AppDeps, str]:
-    capabilities = [TemporalDurability()]
+    capabilities = [TemporalDurability(), CallLedger()]
     if advisor_model:
         capabilities.append(Advisor(advisor_model, mode="native"))
     agent: Agent[AppDeps, str] = Agent(model, name="vis-lead", deps_type=AppDeps,

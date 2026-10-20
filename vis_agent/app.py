@@ -4,7 +4,6 @@ import logging
 import os
 from pathlib import Path
 
-import logfire
 from dotenv import load_dotenv
 from pydantic_ai import Agent
 
@@ -14,14 +13,13 @@ from vis_agent.renders import add_render_routes
 from vis_agent.requests.api import add_request_routes
 from vis_agent.requests.store import RequestStore
 from vis_agent.store import DatasetStore
+from vis_agent.tracing import configure_tracing
 from vis_agent.uploads import add_upload_routes
 
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-logfire.configure(send_to_logfire="if-token-present", service_name="vis-agent", console=False)
-logfire.instrument_pydantic_ai()
-
 data_directory = Path(os.getenv("DATA_DIRECTORY", str(Path(__file__).parent.parent / "data")))
+configure_tracing(data_directory)
 database = Path(os.environ["DUCKDB_PATH"]) if os.getenv("DUCKDB_PATH") else None
 
 store = DatasetStore(

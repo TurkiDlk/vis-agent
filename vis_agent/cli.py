@@ -94,6 +94,12 @@ def build_parser() -> argparse.ArgumentParser:
     design.add_argument("--no-render", action="store_true")
     design.add_argument("--renderer", choices=["gptvis"], default="gptvis")
     commands.add_parser("doctor", help="Check Node, the renderer package, and an Arabic smoke render.")
+    traced = commands.add_parser("trace", help="Show a lead run's timeline and where its model requests went.")
+    traced.add_argument("trace_id", nargs="?", help="A trace ID or its prefix. Default: the latest lead run.")
+    traced.add_argument("--request", help="Runs that touched this rq_ visualization request.")
+    traced.add_argument("--conversation", help="Runs of this chat conversation.")
+    traced.add_argument("--list", type=int, metavar="N", help="List the latest N runs instead of one report.")
+    traced.add_argument("--json", action="store_true", help="Print the accounting as JSON.")
     return parser
 
 
@@ -242,6 +248,39 @@ def suggest_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def trace_command(args: argparse.Namespace) -> int:
+    """Read local trace files only; no provider or model is needed."""
+    import os
+
+    from dotenv import load_dotenv
+
+    from vis_agent import trace_report
+
+    load_dotenv()
+    data = Path(os.getenv("DATA_DIRECTORY", str(Path(__file__).parent.parent / "data")))
+    directory = Path(os.getenv("VIS_TRACE_DIR") or data / "traces")
+    runs = trace_report.find_runs(trace_report.load_spans(directory), trace_id=args.trace_id,
+                                  request_id=args.request, conversation_id=args.conversation)
+    if not runs:
+        _print_json({"error": f"No recorded lead run matches in {directory}."})
+        return 2
+    if args.list:
+        summaries = [trace_report.summarize(spans) for spans in list(runs.values())[-args.list:]]
+        if args.json:
+            _print_json([{k: v for k, v in s.items() if k != "calls"} for s in summaries])
+        for s in [] if args.json else summaries:
+            limit = " LIMIT" if s["request_limit_reached"] else ""
+            print(f'{s["trace_id"]}  {s["started"]}  {s["seconds"]:>7}s  {s["status"]:<5}  '
+                  f'{s["counted_calls"]}/{s["request_limit"]} calls{limit}  {s["counted_by_agent"]}')
+        return 0
+    spans = list(runs.values())[-1]
+    if args.json:
+        _print_json(trace_report.summarize(spans))
+    else:
+        print(trace_report.report(spans))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -264,6 +303,8 @@ def main(argv: list[str] | None = None) -> int:
         except (DatasetNotFound, RequestNotFound, ArtifactNotFound, OSError, ValidationError, ValueError) as error:
             _print_json({"error": str(error)})
             return 2
+    if args.command == "trace":
+        return trace_command(args)
     if args.command == "chat":
         agent, deps, _store, _profiler, _analyst, _designer = resources()
         agent.to_cli_sync(deps=replace(deps, caller_kind="terminal"), prog_name="vis")

@@ -24,6 +24,7 @@ from vis_agent.labels import project_display_labels
 from vis_agent.profiler.measurements import GEOMETRY_NAME, MAX_MODEL_VALUE_BYTES, WKT_SQL_PATTERN
 from vis_agent.reviewer.models import Review, ReviewColumn, ReviewerPrompt, ReviewReport, VisualFinding
 from vis_agent.reviewer.rubric import rubric_text
+from vis_agent.tracing import CallLedger
 
 log = logging.getLogger("reviewer")
 # A seat other than the designer's, able to read a picture; the agreement test (evals/reviewer) picks the final one.
@@ -102,6 +103,7 @@ def create_reviewer(model: str | Model) -> Agent[ReviewerDeps, Review]:
         retries={"output": 2},
         instructions=REVIEWER_RULEBOOK + "\n\n" + rubric_text(),
         model_settings={"thinking": False, "temperature": 0.0},
+        capabilities=[CallLedger()],
     )
 
 
